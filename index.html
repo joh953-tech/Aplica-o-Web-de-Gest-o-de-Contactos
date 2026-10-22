@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestão Inteligente de Contactos - PED-2026-001</title>
+
+    <!-- Tailwind CSS, React, Babel e Tesseract v5 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/tesseract.js@5/dist/tesseract.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useRef, useEffect } = React;
+
+        function App() {
+            const [contacts, setContacts] = useState(() => {
+                const saved = localStorage.getItem('contacts');
+                return saved ? JSON.parse(saved) : [];
+            });
+            const [search, setSearch] = useState('');
+            const [isCameraActive, setIsCameraActive] = useState(false);
+            const [stream, setStream] = useState(null);
+            
+            const [videoDevices, setVideoDevices] = useState([]);
+            const [selectedDeviceId, setSelectedDeviceId] = useState('');
+            const [rotation, setRotation] = useState(0);
+            
+            // Estado do Motor de Reconhecimento
+            const [ocrReady, setOcrReady] = useState(false);
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [confidence, setConfidence] = useState(0);
+            const [statusMessage, setStatusMessage] = useState('A carregar leitor inteligente...');
+            const [lastText, setLastText] = useState('');
+
+            const [formData, setFormData] = useState({
+                nome: '',
+                empresa: '',
+                telefone: '',
+                email: ''
+            });
+
+            const videoRef = useRef(null);
+            const canvasRef = useRef(null);
+            const workerRef = useRef(null);
+            const isProcessingRef = useRef(false);
+            const intervalRef = useRef(null);
+
+            useEffect(() => {
+                localStorage.setItem('contacts', JSON.stringify(contacts));
+            }, [contacts]);
+
+            // Inicializar o Worker do Tesseract
+            useEffect(() => {
+                async function initOCR() {
+                    try {
+                        setStatusMessage('A preparar motor OCR...');
+                        const worker = await Tesseract.createWorker('por+eng');
+                        workerRef.current = worker;
+                        setOcrReady(true);
+                        setStatusMessage('Pronto para digitalizar');
+                    } catch (err) {
+                        console.error("Erro OCR:", err);
+                        setStatusMessage('Erro ao iniciar motor de leitura');
+                    }
+                }
+                initOCR();
+
+                return () => {
+                    if (workerRef.current) {
+                        workerRef.current.terminate();
+                    }
+                };
+            }, []);
+
+            // Listar câmaras disponíveis
+            const loadVideoDevices = async () => {
+                try {
+                    const devices = await navigator.mediaDevices.enumerateDevices();
+                    const cameras = devices.filter(d => d.kind === 'videoinput');
+                    setVideoDevices(cameras);
+                    if (cameras.length > 0 && !selectedDeviceId) {
+                        const backCamera = cameras.find(c => c.label.toLowerCase().includes('back') || c.label.toLowerCase().includes('traseira'));
+                        setSelectedDeviceId(backCamera ? backCamera.deviceId : cameras[0].deviceId);
+                    }
+                } catch (err) {
+                    console.error("Erro câmaras:", err);
+                }
+            };
+
+            useEffect(() => {
+                loadVideoDevices();
+            }, []);
+
+            useEffect(() => {
+                if (isCameraActive && videoRef.current && stream) {
+                    videoRef.current.srcObject = stream;
+                    videoRef.current.play().then(() => {
+                        setStatusMessage('Mantenha o cartão focado na câmara...');
+                        startAutoScanner();
+                    }).catch(err => console.error(err));
+                }
+            }, [isCameraActive, stream]);
+
+            const startCamera = async (deviceId = selectedDeviceId) => {
+                stopCamera();
+                try {
+                    const constraints = {
+                        video: deviceId 
+                            ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+                            : { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
+                    };
+
+                    const newStream = await navigator.mediaDevices.getUserMedia(constraints);
+                    setStream(newStream);
+                    setIsCameraActive(true);
+                    loadVideoDevices();
+                } catch (err) {
+                    try {
+                        const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true });
+                        setStream(fallbackStream);
+                        setIsCameraActive(true);
+                    } catch (e) {
+                        alert("Não foi possível abrir a câmara: " + err.message);
+                        setIsCameraActive(false);
+                    }
+                }
+            };
+
+            const stopCamera = () => {
+                if (intervalRef.current) {
+                    clearInterval(intervalRef.current);
+                    intervalRef.current = null;
+                }
+                if (stream) {
+                    stream.getTracks().forEach(track => track.stop());
+                    setStream(null);
+                }
+                setIsCameraActive(false);
+                setIsProcessing(false);
+                isProcessingRef.current = false;
+            };
+
+            // Digitalização automática estabilizada (a cada 2.5s)
+            const startAutoScanner = () => {
+                if (intervalRef.current) clearInterval(intervalRef.current);
+
+                intervalRef.current = setInterval(() => {
+                    if (!isProcessingRef.current && ocrReady) {
+                        processFrame(false);
+                    }
+                }, 2500);
+            };
+
+            // Função principal de processamento de imagem
+            const processFrame = async (isManual = false) => {
+                if (!videoRef.current || !canvasRef.current || !workerRef.current) return;
+                const video = videoRef.current;
+                
+                if (video.readyState !== video.HAVE_ENOUGH_DATA) return;
+
+                isProcessingRef.current = true;
+                setIsProcessing(true);
+                setStatusMessage(isManual ? 'A processar em alta precisão...' : 'A verificar nitidez...');
+
+                try {
+                    const canvas = canvasRef.current;
+                    const ctx = canvas.getContext('2d');
+
+                    const w = video.videoWidth || 1280;
+                    const h = video.videoHeight || 720;
+
+                    canvas.width = w;
+                    canvas.height = h;
+
+                    ctx.save();
+                    ctx.translate(w / 2, h / 2);
+                    if (rotation !== 0) {
+                        ctx.rotate((rotation * Math.PI) / 180);
+                    }
+                    ctx.drawImage(video, -w / 2, -h / 2, w, h);
+                    ctx.restore();
+
+                    // Pré-processamento de Imagem: Ajuste suave de Nitidez/Contraste sem apagar letras
+                    const procCanvas = document.createElement('canvas');
+                    procCanvas.width = w;
+                    procCanvas.height = h;
+                    const procCtx = procCanvas.getContext('2d');
+                    
+                    procCtx.filter = 'contrast(140%) brightness(105%) grayscale(100%)';
+                    procCtx.drawImage(canvas, 0, 0);
+
+                    // Executar Tesseract OCR
+                    const { data } = await workerRef.current.recognize(procCanvas);
+                    const rawText = data.text || '';
+                    const conf = Math.round(data.confidence || 0);
+
+                    setConfidence(conf);
+                    setLastText(rawText.trim());
+
+                    // Só aceita a leitura se a confiança for >= 60% (ou no clique manual)
+                    if (conf >= 60 || isManual) {
+                        const filled = parseProfessionalText(rawText);
+                        if (filled) {
+                            setStatusMessage(`Sucesso! Confiança: ${conf}%`);
+                            setTimeout(() => {
+                                stopCamera();
+                            }, 500);
+                        } else {
+                            setStatusMessage(isManual ? 'Nenhum contacto válido detetado.' : 'Mantenha o cartão firme e alinhado...');
+                        }
+                    } else {
+                        setStatusMessage(`Imagem desfocada (${conf}% confiança). Aqueça o foco...`);
+                    }
+                } catch (err) {
+                    console.error("Erro no processamento:", err);
+                    setStatusMessage('A tentar novamente...');
+                } finally {
+                    isProcessingRef.current = false;
+                    setIsProcessing(false);
+                }
+            };
+
+            // Extrator Profissional com Expressões Regulares Rigorosas
+            const parseProfessionalText = (text) => {
+                if (!text || text.trim().length < 5) return false;
+
+                // Limpeza de ruídos de leitura
+                const lines = text
+                    .split('\n')
+                    .map(l => l.trim().replace(/[|\\_~`]/g, ''))
+                    .filter(l => l.length > 2 && !/^[0-9\W]+$/.test(l));
+
+                const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/i;
+                const phoneRegex = /(?:\+351\s?)?(?:[29]\d{2}[\s.-]?\d{3}[\s.-]?\d{3}|[29]\d{8})/;
+
+                let detectedEmail = '';
+                let detectedPhone = '';
+                let cleanTextLines = [];
+
+                lines.forEach(line => {
+                    const emailMatch = line.match(emailRegex);
+                    const phoneMatch = line.match(phoneRegex);
+
+                    if (emailMatch && !detectedEmail) {
+                        detectedEmail = emailMatch[0];
+                    } else if (phoneMatch && !detectedPhone) {
+                        detectedPhone = phoneMatch[0];
+                    } else {
+                        // Ignorar palavras reservadas de ruído comuns em cartões
+                        const lower = line.toLowerCase();
+                        if (!lower.includes('tel') && 
+                            !lower.includes('email') && 
+                            !lower.includes('www.') && 
+                            !lower.includes('.pt') && 
+                            !lower.includes('.com')) {
+                            cleanTextLines.push(line);
+                        }
+                    }
+                });
+
+                // Preencher o formulário apenas se existirem dados válidos
+                if (detectedPhone || detectedEmail || cleanTextLines.length >= 1) {
+                    setFormData(prev => ({
+                        nome: cleanTextLines[0] || prev.nome || 'Contacto Lido',
+                        empresa: cleanTextLines[1] || prev.empresa || '',
+                        telefone: detectedPhone || prev.telefone,
+                        email: detectedEmail || prev.email
+                    }));
+                    return true;
+                }
+
+                return false;
+            };
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                if (!formData.nome) return;
+                setContacts([{ ...formData, id: Date.now() }, ...contacts]);
+                setFormData({ nome: '', empresa: '', telefone: '', email: '' });
+                setLastText('');
+                setConfidence(0);
+            };
+
+            const handleDelete = (id) => {
+                setContacts(contacts.filter(c => c.id !== id));
+            };
+
+            const filteredContacts = contacts.filter(c =>
+                c.nome.toLowerCase().includes(search.toLowerCase()) ||
+                c.empresa.toLowerCase().includes(search.toLowerCase())
+            );
+
+            return (
+                <div class="max-w-4xl mx-auto p-4 md:p-6 space-y-6">
+                    <canvas ref={canvasRef} class="hidden"></canvas>
+
+                    <header class="bg-slate-900 border border-slate-800 rounded-2xl p-5 flex justify-between items-center shadow-xl">
+                        <div>
+                            <h1 class="text-xl font-bold text-white flex items-center gap-2.5">
+                                <i class="fa-solid fa-address-card text-indigo-400"></i> Gestão Inteligente de Contactos
+                            </h1>
+                            <p class="text-xs text-slate-400 mt-1">PED-2026-001 • Scanner Profissional com Controlo de Confiança</p>
+                        </div>
+                    </header>
+
+                    <div class="grid md:grid-cols-2 gap-6">
+                        {/* Painel do Formulário & Leitor */}
+                        <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-xl space-y-4">
+                            <h2 class="text-md font-semibold text-slate-200 flex items-center gap-2">
+                                <i class="fa-solid fa-user-plus text-indigo-400"></i> Registar Contacto
+                            </h2>
+
+                            {!isCameraActive ? (
+                                <button
+                                    type="button"
+                                    disabled={!ocrReady}
+                                    onClick={() => startCamera()}
+                                    class="w-full py-3.5 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-semibold rounded-xl flex items-center justify-center gap-2.5 transition-all shadow-lg active:scale-95"
+                                >
+                                    <i class="fa-solid fa-camera"></i> 
+                                    {ocrReady ? 'Abrir Câmara' : 'A carregar motor...'}
+                                </button>
+                            ) : (
+                                <div class="space-y-3 bg-slate-950 p-3 rounded-xl border border-slate-800">
+                                    {videoDevices.length > 1 && (
+                                        <div>
+                                            <select
+                                                value={selectedDeviceId}
+                                                onChange={(e) => {
+                                                    setSelectedDeviceId(e.target.value);
+                                                    startCamera(e.target.value);
+                                                }}
+                                                class="w-full bg-slate-900 border border-slate-700 text-xs text-slate-200 rounded-lg p-2 focus:outline-none"
+                                            >
+                                                {videoDevices.map((dev, idx) => (
+                                                    <option key={dev.deviceId} value={dev.deviceId}>
+                                                        {dev.label || `Câmara ${idx + 1}`}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        </div>
+                                    )}
+
+                                    {/* Visor da Câmara */}
+                                    <div class="relative rounded-lg overflow-hidden bg-black aspect-video flex items-center justify-center">
+                                        <video 
+                                            ref={videoRef} 
+                                            autoPlay 
+                                            playsInline 
+                                            muted
+                                            style={{
+                                                transform: `rotate(${rotation}deg)`,
+                                                transition: 'transform 0.3s ease'
+                                            }}
+                                            class="w-full h-full object-cover"
+                                        ></video>
+                                        
+                                        {/* Moldura Guia */}
+                                        <div class="absolute inset-4 border-2 border-indigo-400/80 rounded-lg pointer-events-none flex flex-col justify-between p-2">
+                                            {isProcessing && (
+                                                <div class="w-full h-1 bg-indigo-400 shadow-[0_0_12px_#818cf8] animate-pulse"></div>
+                                            )}
+                                        </div>
+
+                                        {/* Botão de Rotação 180º */}
+                                        <button
+                                            type="button"
+                                            onClick={() => setRotation((prev) => (prev + 180) % 360)}
+                                            class="absolute top-2 right-2 bg-slate-900/90 hover:bg-slate-800 text-white px-2.5 py-1.5 rounded-lg backdrop-blur-md border border-slate-700 text-xs flex items-center gap-1.5"
+                                            title="Girar 180º (Para ler na mesa)"
+                                        >
+                                            <i class="fa-solid fa-arrows-rotate"></i> {rotation}º
+                                        </button>
+                                    </div>
+
+                                    {/* Barra de Ações e Estado */}
+                                    <div class="flex items-center justify-between text-xs px-1 pt-1">
+                                        <span class={`font-medium flex items-center gap-2 ${confidence >= 60 ? 'text-emerald-400' : 'text-indigo-400'}`}>
+                                            <i class={`fa-solid ${isProcessing ? 'fa-spinner fa-spin' : 'fa-shield-halved'}`}></i>
+                                            {statusMessage}
+                                        </span>
+
+                                        <button
+                                            type="button"
+                                            onClick={stopCamera}
+                                            class="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs border border-slate-700"
+                                        >
+                                            Fechar
+                                        </button>
+                                    </div>
+
+                                    {/* Botão Manual de Alta Precisão */}
+                                    <button
+                                        type="button"
+                                        onClick={() => processFrame(true)}
+                                        disabled={isProcessing}
+                                        class="w-full py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition flex items-center justify-center gap-2 shadow-md active:scale-95"
+                                    >
+                                        <i class="fa-solid fa-bolt"></i> Digitalizar Agora (Alta Precisão)
+                                    </button>
+
+                                    {lastText && (
+                                        <div class="p-2 bg-slate-900/90 border border-slate-800 rounded-lg text-[10px] text-slate-400 font-mono break-all max-h-16 overflow-y-auto">
+                                            <span class="text-slate-500 block text-[9px] uppercase font-sans">Texto Lido ({confidence}% Confiança):</span>
+                                            {lastText}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
+                            {/* Formulário com Confirmação/Edição */}
+                            <form onSubmit={handleSubmit} class="space-y-3 pt-2">
+                                <div>
+                                    <label class="text-xs text-slate-400 mb-1 block">Nome do Contacto *</label>
+                                    <input
+                                        type="text"
+                                        placeholder="Nome"
+                                        value={formData.nome}
+                                        onChange={e => setFormData({ ...formData, nome: e.target.value })}
+                                        class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                                        required
+                                    />
+                                </div>
+
+                                <div>
+                                    <label class="text-xs text-slate-400 mb-1 block">Empresa</label>
+                                    <input
+                                        type="text"
+                                        placeholder="Empresa"
+                                        value={formData.empresa}
+                                        onChange={e => setFormData({ ...formData, empresa: e.target.value })}
+                                        class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                                    />
+                                </div>
+
+                                <div class="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <label class="text-xs text-slate-400 mb-1 block">Telefone</label>
+                                        <input
+                                            type="text"
+                                            placeholder="Telefone"
+                                            value={formData.telefone}
+                                            onChange={e => setFormData({ ...formData, telefone: e.target.value })}
+                                            class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label class="text-xs text-slate-400 mb-1 block">Email</label>
+                                        <input
+                                            type="email"
+                                            placeholder="Email"
+                                            value={formData.email}
+                                            onChange={e => setFormData({ ...formData, email: e.target.value })}
+                                            class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                                        />
+                                    </div>
+                                </div>
+
+                                <button
+                                    type="submit"
+                                    class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-medium text-sm transition mt-2 flex items-center justify-center gap-2"
+                                >
+                                    <i class="fa-solid fa-floppy-disk"></i> Guardar Contacto
+                                </button>
+                            </form>
+                        </div>
+
+                        {/* Lista de Contactos Registados */}
+                        <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-xl space-y-4">
+                            <h2 class="text-md font-semibold text-slate-200 flex items-center gap-2">
+                                <i class="fa-solid fa-address-book text-indigo-400"></i> Contactos Registados ({contacts.length})
+                            </h2>
+
+                            <input
+                                type="text"
+                                placeholder="Pesquisar por nome ou empresa..."
+                                value={search}
+                                onChange={e => setSearch(e.target.value)}
+                                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                            />
+
+                            <div class="space-y-3 max-h-[420px] overflow-y-auto pr-1">
+                                {filteredContacts.length === 0 ? (
+                                    <div class="text-center py-12 text-slate-500 text-sm">
+                                        Nenhum contacto registado.
+                                    </div>
+                                ) : (
+                                    filteredContacts.map(c => (
+                                        <div key={c.id} class="bg-slate-950 border border-slate-800 p-4 rounded-xl space-y-2 relative group hover:border-slate-700 transition">
+                                            <button
+                                                onClick={() => handleDelete(c.id)}
+                                                class="absolute top-3 right-3 text-slate-500 hover:text-red-400 transition text-sm"
+                                                title="Eliminar"
+                                            >
+                                                <i class="fa-solid fa-trash"></i>
+                                            </button>
+                                            
+                                            <div>
+                                                <h3 class="font-semibold text-slate-100">{c.nome}</h3>
+                                                {c.empresa && <p class="text-xs text-indigo-400 font-medium">{c.empresa}</p>}
+                                            </div>
+
+                                            <div class="text-xs text-slate-400 space-y-1 pt-1 border-t border-slate-800/80">
+                                                {c.telefone && <p><i class="fa-solid fa-phone text-slate-500 w-4"></i> {c.telefone}</p>}
+                                                {c.email && <p><i class="fa-solid fa-envelope text-slate-500 w-4"></i> {c.email}</p>}
+                                            </div>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
