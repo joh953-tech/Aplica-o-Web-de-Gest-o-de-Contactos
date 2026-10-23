@@ -5,81 +5,405 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Gestão Inteligente de Contactos - PED-2026-001</title>
 
-    <!-- Tailwind CSS, React, Babel e Tesseract v5 -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <script src="https://unpkg.com/tesseract.js@5/dist/tesseract.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body{font-family:'Inter',system-ui,sans-serif;background:radial-gradient(900px 500px at 8% -10%,rgba(99,102,241,.18),transparent 60%),radial-gradient(700px 400px at 100% 0%,rgba(16,185,129,.09),transparent 60%),#020617;background-attachment:fixed}
+        .fade-in{animation:fadeIn .25s ease-out}
+        @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+        .scanline{animation:scan 1.6s ease-in-out infinite}
+        @keyframes scan{0%{top:6%}50%{top:92%}100%{top:6%}}
+        .autofill{box-shadow:0 0 0 1px rgba(52,211,153,.6)}
+    </style>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
+<body class="text-slate-100 min-h-screen selection:bg-indigo-500 selection:text-white antialiased">
     <div id="root"></div>
 
     <script type="text/babel">
         const { useState, useRef, useEffect } = React;
 
+        // ===== Pré-processamento e extração de dados de cartões de visita =====
+
+        // Redimensiona, converte para cinzento e estica o contraste.
+        // NÃO binariza: o Tesseract já faz a sua própria binarização, bem melhor com texto pequeno
+        // (o limiar de Otsu global apagava as letras finas do nome e do email e só preservava os números grandes).
+        function enhanceForOCR(src) {
+            const targetW = 2200;
+            const scale = Math.min(3, Math.max(0.4, targetW / src.width));
+            const out = document.createElement('canvas');
+            out.width = Math.round(src.width * scale);
+            out.height = Math.round(src.height * scale);
+            const octx = out.getContext('2d', { willReadFrequently: true });
+            octx.imageSmoothingEnabled = true;
+            octx.imageSmoothingQuality = 'high';
+            octx.drawImage(src, 0, 0, out.width, out.height);
+
+            const img = octx.getImageData(0, 0, out.width, out.height);
+            const d = img.data;
+            const hist = new Array(256).fill(0);
+            let sum = 0;
+            for (let i = 0; i < d.length; i += 4) {
+                const g = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+                d[i] = g;
+                hist[g]++;
+                sum += g;
+            }
+            const total = d.length / 4;
+            const mean = sum / total;
+
+            let acc = 0, lo = 0, hi = 255;
+            for (let t = 0; t < 256; t++) { acc += hist[t]; if (acc >= total * 0.01) { lo = t; break; } }
+            acc = 0;
+            for (let t = 255; t >= 0; t--) { acc += hist[t]; if (acc >= total * 0.01) { hi = t; break; } }
+            if (hi - lo < 30) { lo = Math.max(0, lo - 15); hi = Math.min(255, hi + 15); }
+            const range = Math.max(1, hi - lo);
+            const invert = mean < 110; // cartão escuro com texto claro -> inverter
+
+            for (let i = 0; i < d.length; i += 4) {
+                let v = ((d[i] - lo) * 255) / range;
+                v = v < 0 ? 0 : v > 255 ? 255 : v;
+                if (invert) v = 255 - v;
+                d[i] = d[i + 1] = d[i + 2] = v;
+                d[i + 3] = 255;
+            }
+            octx.putImageData(img, 0, 0);
+            return out;
+        }
+
+        // Binarização adaptativa (limiar local): ao contrário do Otsu global, aguenta sombras e luz desigual
+        function adaptiveBinarize(src) {
+            const w = src.width, hgt = src.height;
+            const c = document.createElement('canvas');
+            c.width = w; c.height = hgt;
+            const x = c.getContext('2d', { willReadFrequently: true });
+            x.drawImage(src, 0, 0);
+            const im = x.getImageData(0, 0, w, hgt), d = im.data;
+            const W1 = w + 1;
+            const I = new Float64Array(W1 * (hgt + 1));
+            for (let y = 0; y < hgt; y++) {
+                let row = 0;
+                for (let xx = 0; xx < w; xx++) {
+                    row += d[(y * w + xx) * 4];
+                    I[(y + 1) * W1 + xx + 1] = I[y * W1 + xx + 1] + row;
+                }
+            }
+            const r = Math.max(8, Math.round(w / 60));
+            for (let y = 0; y < hgt; y++) {
+                const y0 = Math.max(0, y - r), y1 = Math.min(hgt, y + r + 1);
+                for (let xx = 0; xx < w; xx++) {
+                    const x0 = Math.max(0, xx - r), x1 = Math.min(w, xx + r + 1);
+                    const s = I[y1 * W1 + x1] - I[y0 * W1 + x1] - I[y1 * W1 + x0] + I[y0 * W1 + x0];
+                    const mean = s / ((x1 - x0) * (y1 - y0));
+                    const i = (y * w + xx) * 4;
+                    const v = d[i] < mean * 0.9 ? 0 : 255;
+                    d[i] = d[i + 1] = d[i + 2] = v;
+                }
+            }
+            x.putImageData(im, 0, 0);
+            return c;
+        }
+
+        const EMAIL_RE = /[a-z0-9][a-z0-9._%+\-]*@[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}/gi;
+        const PHONE_PT_RE = /(?:\(?(?:\+|00)?351\)?[\s.\-]?)?[239](?:[\s.\-]?\d){8}/g;
+        const PHONE_INTL_RE = /\+\d{1,3}(?:[\s.\-]?\d){7,12}/;
+        const URL_RE = /(www\.|https?:|\b[a-z0-9\-]+\.(?:pt|com|net|org|eu|es|fr|co|io|biz|info)\b)/i;
+        const LABEL_RE = /^\s*(tel|tlm|tlf|telem|telef|fax|e-?mail|mob|mobile|phone|site|web|www|nif)\b/i;
+        const SKIP_PHONE_RE = /\bnif\b|contribuinte|\bvat\b|iban/i;
+        const FAX_RE = /fax\s*[:.]?\s*[+()\d\s.\-]+/gi;
+        const COMPANY_RE = /\b(lda\.?|unipessoal|sgps|ltd|llc|inc|gmbh|s\.l\.?|sociedade|com[eé]rcio|servi[cç]os|consultoria|engenharia|constru[cç][oõ]es|ind[uú]stria|group|grupo|solutions|systems|technologies|associados|& filhos|e filhos)\b/i;
+        const COMPANY_CS_RE = /\bS\.?A\.?\b/;
+        const JOB_RE = /\b(diretor|director|diretora|gerente|gestor|gestora|administrador|administradora|engenheir[oa]|arquitet[oa]|comercial|consultor|consultora|t[eé]cnic[oa]|respons[aá]vel|manager|ceo|cto|cfo|coo|sales|developer|designer|advogad[oa]|m[eé]dic[oa]|analista|coordenador|coordenadora|assistente|presidente|fundador|partner|s[oó]cio|executive|specialist|especialista|supervisor|chefe|head|owner|propriet[aá]rio)\b/i;
+        const ADDR_RE = /\b(rua|avenida|av|pra[cç]a|largo|travessa|estrada|zona|lote|edif[ií]cio|urb|apartado|bairro|parque|andar|loja|fra[cç][aã]o|sala|km)\b|\b\d{4}[\-\s]\d{3}\b/i;
+        const TITLE_PREFIX_RE = /^(dr\.?|dra\.?|eng\.?|eng\.?ª|arq\.?|prof\.?|prof\.?ª|sr\.?|sra\.?|mr\.?|ms\.?|mrs\.?)\s+/i;
+        const PARTICLES = new Set(['de', 'da', 'do', 'dos', 'das', 'e', 'di', 'van', 'von', 'del', 'la', 'le']);
+        const GENERIC_PROVIDERS = new Set(['gmail', 'hotmail', 'outlook', 'live', 'sapo', 'yahoo', 'icloud', 'mail', 'msn', 'iol', 'netcabo', 'clix', 'proton', 'protonmail', 'gmx', 'aol']);
+        const GENERIC_LOCAL = new Set(['info', 'geral', 'comercial', 'contacto', 'contact', 'sales', 'admin', 'office', 'suporte', 'support', 'mail', 'vendas', 'marketing', 'rh', 'financeiro']);
+
+        function stripAccents(s) {
+            return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+        }
+
+        function findEmails(text) {
+            let t = text
+                .replace(/[©®]/g, '@')
+                .replace(/\(\s*(?:at|a)\s*\)|\[\s*at\s*\]/gi, '@')
+                .replace(/\s*@\s*/g, '@');
+            if (!t.includes('@')) return [];
+            // 1.º tenta com os espaços originais (evita colar o email ao texto seguinte), 2.º sem espaços
+            const candidates = [t, t.replace(/\s+/g, '')];
+            for (const cand of candidates) {
+                const fixed = cand.replace(/(@[a-z0-9.\-]*),([a-z]{2,4})(?![a-z])/i, '$1.$2'); // "empresa,pt" -> "empresa.pt"
+                const m = fixed.match(EMAIL_RE);
+                if (m) return m.map(x => x.toLowerCase());
+            }
+            return [];
+        }
+
+        function fixDigitLookalikes(line) {
+            return line.split(/(\s+)/).map(tok =>
+                (/\d/.test(tok) && /^[+()\d OolI|.\-]+$/.test(tok)) ? tok.replace(/[Oo]/g, '0').replace(/[lI|]/g, '1') : tok
+            ).join('');
+        }
+
+        function findPhones(line) {
+            if (SKIP_PHONE_RE.test(line)) return [];
+            const t = fixDigitLookalikes(line.replace(FAX_RE, ' '));
+            const re = new RegExp(PHONE_PT_RE.source, 'g');
+            const out = [];
+            let m;
+            while ((m = re.exec(t)) !== null) {
+                const before = t[m.index - 1];
+                const after = t[m.index + m[0].length];
+                if ((before && /\d/.test(before)) || (after && /\d/.test(after))) continue;
+                let digits = m[0].replace(/\D/g, '').replace(/^00/, '');
+                let intl = false;
+                if (digits.length === 12 && digits.startsWith('351')) { digits = digits.slice(3); intl = true; }
+                if (digits.length !== 9) continue;
+                const fmt = `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}`;
+                out.push({ text: intl ? `+351 ${fmt}` : fmt, mobile: /^9[1236]/.test(digits) });
+            }
+            return out;
+        }
+
+        function levenshtein(a, b) {
+            const m = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+            for (let j = 1; j <= b.length; j++) m[0][j] = j;
+            for (let i = 1; i <= a.length; i++)
+                for (let j = 1; j <= b.length; j++)
+                    m[i][j] = Math.min(m[i - 1][j] + 1, m[i][j - 1] + 1, m[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+            return m[a.length][b.length];
+        }
+
+        const inputCls = 'w-full bg-slate-950/70 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 transition';
+        const initials = (n) => (n || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('');
+
+        function extractContactData(passes) {
+            const rawText = passes.map((p, i) => `--- passagem ${i + 1}${p.aux ? ' (email/telefone)' : ''} ---\n${(p.text || '').trim()}`).join('\n\n');
+
+            // Linhas com altura relativa (texto maior => nome / empresa)
+            const entries = [];
+            passes.filter(p => !p.aux).forEach(data => {
+                let lines = (data.lines || []).map(l => ({
+                    text: (l.text || '').replace(/\s+/g, ' ').trim(),
+                    h: l.bbox ? (l.bbox.y1 - l.bbox.y0) : 0,
+                    conf: typeof l.confidence === 'number' ? l.confidence : 70
+                }));
+                if (!lines.length) lines = (data.text || '').split('\n').map(t => ({ text: t.trim(), h: 0, conf: 70 }));
+                lines = lines.filter(l => l.text.length > 1);
+                const hs = lines.map(l => l.h).filter(h => h > 0).sort((a, b) => a - b);
+                const median = hs.length ? hs[Math.floor(hs.length / 2)] : 0;
+                lines.forEach(l => entries.push({ ...l, rel: median && l.h ? l.h / median : 1 }));
+            });
+            const byKey = new Map();
+            entries.forEach(e => {
+                const k = stripAccents(e.text).replace(/[^a-z0-9@]/g, '');
+                if (!k) return;
+                const prev = byKey.get(k);
+                if (!prev || e.conf > prev.conf) byKey.set(k, e);
+            });
+            const lines = Array.from(byKey.values());
+            const allTexts = passes.flatMap(p => (p.text || '').split('\n')).map(t => t.trim()).filter(Boolean);
+
+            // ---- Email (o mais repetido nas duas passagens) ----
+            const emailCount = new Map();
+            allTexts.forEach(t => findEmails(t).forEach(e => emailCount.set(e, (emailCount.get(e) || 0) + 1)));
+            let foundEmail = Array.from(emailCount.entries()).sort((a, b) => b[1] - a[1]).map(x => x[0])[0] || '';
+
+            // Validar o domínio do email com o site do cartão (corrige 1-2 letras mal lidas)
+            const siteM = allTexts.map(t => t.match(/www\.([a-z0-9\-]+)\.[a-z]{2,}/i)).find(Boolean);
+            if (foundEmail && siteM) {
+                const siteRoot = siteM[1].toLowerCase();
+                const [lp, dom] = foundEmail.split('@');
+                const parts = dom.split('.');
+                if (parts[0] !== siteRoot && !GENERIC_PROVIDERS.has(parts[0]) && levenshtein(parts[0], siteRoot) <= 2) {
+                    foundEmail = `${lp}@${[siteRoot, ...parts.slice(1)].join('.')}`;
+                }
+            }
+
+            // ---- Telefone (preferência: mais repetido, depois telemóvel) ----
+            const phoneMap = new Map();
+            allTexts.forEach(t => findPhones(t).forEach(p => {
+                const e = phoneMap.get(p.text) || { ...p, count: 0 };
+                e.count++;
+                phoneMap.set(p.text, e);
+            }));
+            let foundPhone = Array.from(phoneMap.values())
+                .sort((a, b) => (b.count - a.count) || ((b.mobile ? 1 : 0) - (a.mobile ? 1 : 0)))
+                .map(p => p.text)[0] || '';
+            if (!foundPhone) {
+                for (const t of allTexts) {
+                    if (SKIP_PHONE_RE.test(t)) continue;
+                    const m = t.replace(FAX_RE, ' ').match(PHONE_INTL_RE);
+                    if (m) { foundPhone = m[0].trim(); break; }
+                }
+            }
+
+            // ---- Pistas a partir do email ----
+            const local = foundEmail ? stripAccents(foundEmail.split('@')[0]) : '';
+            const domainRoot = foundEmail ? stripAccents(foundEmail.split('@')[1]).split('.')[0] : '';
+            const domainUseful = domainRoot.length >= 3 && !GENERIC_PROVIDERS.has(domainRoot);
+
+            const isContactLine = (txt) =>
+                /@/.test(txt) || findEmails(txt).length > 0 || findPhones(txt).length > 0 ||
+                URL_RE.test(txt) || LABEL_RE.test(txt) || txt.replace(/\D/g, '').length >= 7;
+
+            const cleanName = (s) => s
+                .replace(/^[^A-Za-zÀ-ÖØ-öø-ÿ]+/, '')
+                .replace(/[^A-Za-zÀ-ÖØ-öø-ÿ.]+$/, '')
+                .replace(/\s+/g, ' ');
+
+            const nameShape = (s) => {
+                const t = cleanName(s.replace(TITLE_PREFIX_RE, ''));
+                if (/\d|@/.test(t)) return null;
+                if (!/^[A-Za-zÀ-ÖØ-öø-ÿ'’.\- ]+$/.test(t)) return null;
+                const words = t.split(' ').filter(Boolean);
+                const main = words.filter(w => !PARTICLES.has(w.toLowerCase()));
+                if (words.length < 2 || words.length > 5 || main.length < 2) return null;
+                if (main.some(w => w.replace(/[.\-']/g, '').length < 2 && !/^[A-Z]\.$/.test(w))) return null;
+                return { text: t, words, main };
+            };
+
+            // ---- Nome ----
+            let name = '';
+            let nameLineIdx = -1;
+            let bestNameScore = -Infinity;
+            lines.forEach((l, idx) => {
+                if (isContactLine(l.text)) return;
+                const shape = nameShape(l.text);
+                if (!shape) return;
+                let score = shape.words.length <= 4 ? 3 : 1;
+                const allCaps = shape.main.every(w => w === w.toUpperCase());
+                const titleCase = shape.main.every(w => /^[A-ZÀ-ÖØ-Þ]/.test(w));
+                if (titleCase && !allCaps) score += 3; else if (allCaps) score += 1;
+                if (TITLE_PREFIX_RE.test(l.text)) score += 2;
+                if (COMPANY_RE.test(l.text) || COMPANY_CS_RE.test(l.text)) score -= 6;
+                if (JOB_RE.test(l.text)) score -= 6;
+                if (ADDR_RE.test(l.text)) score -= 6;
+                const matches = local ? shape.main.filter(w => {
+                    const a = stripAccents(w).replace(/[^a-z]/g, '');
+                    return a.length >= 3 && local.includes(a);
+                }).length : 0;
+                score += matches * 3;
+                if (l.rel > 1.15) score += 1;
+                if (l.conf < 50) score -= 2; else if (l.conf > 80) score += 1;
+                score -= idx * 0.1;
+                if (score > bestNameScore) { bestNameScore = score; name = shape.text; nameLineIdx = idx; }
+            });
+            if (bestNameScore < 3) { name = ''; nameLineIdx = -1; }
+
+            // Último recurso: deduzir do email (ex.: joao.silva@...)
+            if (!name && local && /^[a-z]{2,}[._\-][a-z]{2,}$/.test(local)) {
+                const toks = local.split(/[._\-]/);
+                if (!toks.some(t => GENERIC_LOCAL.has(t))) {
+                    name = toks.map(t => t.charAt(0).toUpperCase() + t.slice(1)).join(' ');
+                }
+            }
+
+            // ---- Cargo ----
+            let cargo = '';
+            for (const l of lines) {
+                if (isContactLine(l.text) || ADDR_RE.test(l.text)) continue;
+                if (JOB_RE.test(l.text) && !COMPANY_RE.test(l.text) && !/\d/.test(l.text)) {
+                    cargo = l.text.replace(/^[^A-Za-zÀ-ÖØ-öø-ÿ]+/, '').replace(/[^A-Za-zÀ-ÖØ-öø-ÿ.)]+$/, '');
+                    break;
+                }
+            }
+
+            // ---- Empresa ----
+            let empresa = '';
+            let bestCompScore = -Infinity;
+            lines.forEach((l, idx) => {
+                if (idx === nameLineIdx) return;
+                const txt = l.text;
+                if (isContactLine(txt) || ADDR_RE.test(txt) || JOB_RE.test(txt)) return;
+                const letters = (txt.match(/[A-Za-zÀ-ÖØ-öø-ÿ]/g) || []).length;
+                if (letters < 3 || letters / txt.length < 0.6 || txt.length > 45) return;
+                let score = 0;
+                if (COMPANY_RE.test(txt) || COMPANY_CS_RE.test(txt)) score += 5;
+                if (domainUseful && stripAccents(txt).replace(/[^a-z0-9]/g, '').includes(domainRoot)) score += 4;
+                if (l.rel > 1.3) score += 2;
+                if (l.conf > 70) score += 1; else if (l.conf < 50) score -= 2;
+                if (nameShape(txt) && !(COMPANY_RE.test(txt) || COMPANY_CS_RE.test(txt))) score -= 0.3;
+                score -= idx * 0.05;
+                if (score > bestCompScore) { bestCompScore = score; empresa = txt.replace(/^[^A-Za-zÀ-ÖØ-öø-ÿ0-9]+/, '').replace(/[|\-–—_]+$/, '').trim(); }
+            });
+            if (bestCompScore < 0.5) empresa = '';
+            if (!empresa && domainUseful) empresa = domainRoot.charAt(0).toUpperCase() + domainRoot.slice(1);
+
+            return { nome: name, empresa, telefone: foundPhone, email: foundEmail, cargo, rawText };
+        }
+
+
         function App() {
             const [contacts, setContacts] = useState(() => {
-                const saved = localStorage.getItem('contacts');
+                const saved = localStorage.getItem('contacts_v2');
                 return saved ? JSON.parse(saved) : [];
             });
+
             const [search, setSearch] = useState('');
+            const [editingId, setEditingId] = useState(null);
             const [isCameraActive, setIsCameraActive] = useState(false);
             const [stream, setStream] = useState(null);
             
             const [videoDevices, setVideoDevices] = useState([]);
             const [selectedDeviceId, setSelectedDeviceId] = useState('');
             const [rotation, setRotation] = useState(0);
+            const [isMirrored, setIsMirrored] = useState(false);
             
-            // Estado do Motor de Reconhecimento
             const [ocrReady, setOcrReady] = useState(false);
             const [isProcessing, setIsProcessing] = useState(false);
-            const [confidence, setConfidence] = useState(0);
-            const [statusMessage, setStatusMessage] = useState('A carregar leitor inteligente...');
-            const [lastText, setLastText] = useState('');
+            const [statusMessage, setStatusMessage] = useState('Pronto a digitalizar.');
+            const [permissionError, setPermissionError] = useState(false);
+            const [toast, setToast] = useState(null);
+            const [rawText, setRawText] = useState('');
+            const [auto, setAuto] = useState({});
 
             const [formData, setFormData] = useState({
                 nome: '',
                 empresa: '',
                 telefone: '',
-                email: ''
+                email: '',
+                notas: ''
             });
 
             const videoRef = useRef(null);
             const canvasRef = useRef(null);
+            const fileInputRef = useRef(null);
             const workerRef = useRef(null);
-            const isProcessingRef = useRef(false);
-            const intervalRef = useRef(null);
 
             useEffect(() => {
-                localStorage.setItem('contacts', JSON.stringify(contacts));
+                localStorage.setItem('contacts_v2', JSON.stringify(contacts));
             }, [contacts]);
 
-            // Inicializar o Worker do Tesseract
+            const showToast = (msg, type = 'info') => {
+                setToast({ msg, type });
+                setTimeout(() => setToast(null), 3000);
+            };
+
+            // Inicializar o Tesseract OCR
             useEffect(() => {
                 async function initOCR() {
                     try {
-                        setStatusMessage('A preparar motor OCR...');
                         const worker = await Tesseract.createWorker('por+eng');
+                        await worker.setParameters({ preserve_interword_spaces: '1', user_defined_dpi: '300' });
                         workerRef.current = worker;
                         setOcrReady(true);
-                        setStatusMessage('Pronto para digitalizar');
                     } catch (err) {
                         console.error("Erro OCR:", err);
-                        setStatusMessage('Erro ao iniciar motor de leitura');
                     }
                 }
                 initOCR();
 
                 return () => {
-                    if (workerRef.current) {
-                        workerRef.current.terminate();
-                    }
+                    if (workerRef.current) workerRef.current.terminate();
                 };
             }, []);
 
-            // Listar câmaras disponíveis
             const loadVideoDevices = async () => {
                 try {
                     const devices = await navigator.mediaDevices.enumerateDevices();
@@ -94,261 +418,361 @@
                 }
             };
 
-            useEffect(() => {
-                loadVideoDevices();
-            }, []);
+            useEffect(() => { loadVideoDevices(); }, []);
 
             useEffect(() => {
                 if (isCameraActive && videoRef.current && stream) {
                     videoRef.current.srcObject = stream;
-                    videoRef.current.play().then(() => {
-                        setStatusMessage('Mantenha o cartão focado na câmara...');
-                        startAutoScanner();
-                    }).catch(err => console.error(err));
+                    videoRef.current.play().catch(err => console.error(err));
                 }
             }, [isCameraActive, stream]);
 
             const startCamera = async (deviceId = selectedDeviceId) => {
                 stopCamera();
+                setPermissionError(false);
+
                 try {
                     const constraints = {
                         video: deviceId 
-                            ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
-                            : { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
+                            ? { deviceId: { exact: deviceId }, width: { ideal: 3840 }, height: { ideal: 2160 } }
+                            : { facingMode: 'environment', width: { ideal: 3840 }, height: { ideal: 2160 } }
                     };
 
                     const newStream = await navigator.mediaDevices.getUserMedia(constraints);
+                    try {
+                        const track = newStream.getVideoTracks()[0];
+                        const caps = track.getCapabilities ? track.getCapabilities() : {};
+                        if (caps.focusMode && caps.focusMode.includes('continuous')) {
+                            await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+                        }
+                    } catch (e) { /* focagem contínua não suportada */ }
                     setStream(newStream);
                     setIsCameraActive(true);
+                    setStatusMessage('Enquadra o cartão e clica no botão.');
                     loadVideoDevices();
                 } catch (err) {
-                    try {
-                        const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true });
-                        setStream(fallbackStream);
-                        setIsCameraActive(true);
-                    } catch (e) {
-                        alert("Não foi possível abrir a câmara: " + err.message);
-                        setIsCameraActive(false);
-                    }
+                    console.error("Erro de permissão:", err);
+                    setPermissionError(true);
+                    setIsCameraActive(false);
                 }
             };
 
             const stopCamera = () => {
-                if (intervalRef.current) {
-                    clearInterval(intervalRef.current);
-                    intervalRef.current = null;
-                }
                 if (stream) {
                     stream.getTracks().forEach(track => track.stop());
                     setStream(null);
                 }
                 setIsCameraActive(false);
                 setIsProcessing(false);
-                isProcessingRef.current = false;
             };
 
-            // Digitalização automática estabilizada (a cada 2.5s)
-            const startAutoScanner = () => {
-                if (intervalRef.current) clearInterval(intervalRef.current);
-
-                intervalRef.current = setInterval(() => {
-                    if (!isProcessingRef.current && ocrReady) {
-                        processFrame(false);
-                    }
-                }, 2500);
+            // 4 passagens que "votam" entre si: texto disperso, bloco, imagem binarizada localmente
+            // e uma passagem restrita a caracteres de email/telefone (só usada para esses campos)
+            const runOCR = async (gray) => {
+                const worker = workerRef.current;
+                const bin = adaptiveBinarize(gray);
+                const WL = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@._-+() ';
+                const jobs = [
+                    { img: gray, psm: '11' },
+                    { img: gray, psm: '6' },
+                    { img: bin, psm: '11' },
+                    { img: gray, psm: '11', wl: WL, aux: true }
+                ];
+                const passes = [];
+                for (let i = 0; i < jobs.length; i++) {
+                    setStatusMessage(`A ler o cartão... passagem ${i + 1}/${jobs.length}`);
+                    await worker.setParameters({ tessedit_pageseg_mode: jobs[i].psm, tessedit_char_whitelist: jobs[i].wl || '' });
+                    const { data } = await worker.recognize(jobs[i].img);
+                    data.aux = !!jobs[i].aux;
+                    passes.push(data);
+                }
+                await worker.setParameters({ tessedit_char_whitelist: '' });
+                return passes;
             };
 
-            // Função principal de processamento de imagem
-            const processFrame = async (isManual = false) => {
+            const captureAndProcess = async () => {
                 if (!videoRef.current || !canvasRef.current || !workerRef.current) return;
                 const video = videoRef.current;
                 
                 if (video.readyState !== video.HAVE_ENOUGH_DATA) return;
 
-                isProcessingRef.current = true;
                 setIsProcessing(true);
-                setStatusMessage(isManual ? 'A processar em alta precisão...' : 'A verificar nitidez...');
+                setStatusMessage('A analisar cartão e dados de contacto...');
 
                 try {
                     const canvas = canvasRef.current;
                     const ctx = canvas.getContext('2d');
 
-                    const w = video.videoWidth || 1280;
-                    const h = video.videoHeight || 720;
+                    const vW = video.videoWidth || 1280;
+                    const vH = video.videoHeight || 720;
 
-                    canvas.width = w;
-                    canvas.height = h;
+                    const cropW = vW * 0.85;
+                    const cropH = vH * 0.65;
+                    const cropX = (vW - cropW) / 2;
+                    const cropY = (vH - cropH) / 2;
+
+                    canvas.width = cropW;
+                    canvas.height = cropH;
 
                     ctx.save();
-                    ctx.translate(w / 2, h / 2);
-                    if (rotation !== 0) {
-                        ctx.rotate((rotation * Math.PI) / 180);
-                    }
-                    ctx.drawImage(video, -w / 2, -h / 2, w, h);
+                    ctx.translate(cropW / 2, cropH / 2);
+                    
+                    if (rotation !== 0) ctx.rotate((rotation * Math.PI) / 180);
+                    if (isMirrored) ctx.scale(-1, 1);
+
+                    ctx.drawImage(video, cropX, cropY, cropW, cropH, -cropW / 2, -cropH / 2, cropW, cropH);
                     ctx.restore();
 
-                    // Pré-processamento de Imagem: Ajuste suave de Nitidez/Contraste sem apagar letras
-                    const procCanvas = document.createElement('canvas');
-                    procCanvas.width = w;
-                    procCanvas.height = h;
-                    const procCtx = procCanvas.getContext('2d');
-                    
-                    procCtx.filter = 'contrast(140%) brightness(105%) grayscale(100%)';
-                    procCtx.drawImage(canvas, 0, 0);
-
-                    // Executar Tesseract OCR
-                    const { data } = await workerRef.current.recognize(procCanvas);
-                    const rawText = data.text || '';
-                    const conf = Math.round(data.confidence || 0);
-
-                    setConfidence(conf);
-                    setLastText(rawText.trim());
-
-                    // Só aceita a leitura se a confiança for >= 60% (ou no clique manual)
-                    if (conf >= 60 || isManual) {
-                        const filled = parseProfessionalText(rawText);
-                        if (filled) {
-                            setStatusMessage(`Sucesso! Confiança: ${conf}%`);
-                            setTimeout(() => {
-                                stopCamera();
-                            }, 500);
-                        } else {
-                            setStatusMessage(isManual ? 'Nenhum contacto válido detetado.' : 'Mantenha o cartão firme e alinhado...');
-                        }
+                    const passes = await runOCR(enhanceForOCR(canvas));
+                    const result = parseTextAndFill(passes);
+                    if (result === 'full') {
+                        showToast('Cartão lido com sucesso!', 'success');
+                        setTimeout(() => stopCamera(), 400);
+                    } else if (result === 'partial') {
+                        showToast('Leitura parcial: confirma os campos ou tira outra foto.', 'warning');
                     } else {
-                        setStatusMessage(`Imagem desfocada (${conf}% confiança). Aqueça o foco...`);
+                        showToast('Não foi possível reconhecer dados claros.', 'warning');
                     }
                 } catch (err) {
-                    console.error("Erro no processamento:", err);
-                    setStatusMessage('A tentar novamente...');
+                    console.error("Erro na leitura:", err);
+                    showToast('Erro ao processar imagem.', 'error');
                 } finally {
-                    isProcessingRef.current = false;
                     setIsProcessing(false);
                 }
             };
 
-            // Extrator Profissional com Expressões Regulares Rigorosas
-            const parseProfessionalText = (text) => {
-                if (!text || text.trim().length < 5) return false;
+            const handleFileUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file || !workerRef.current) return;
 
-                // Limpeza de ruídos de leitura
-                const lines = text
-                    .split('\n')
-                    .map(l => l.trim().replace(/[|\\_~`]/g, ''))
-                    .filter(l => l.length > 2 && !/^[0-9\W]+$/.test(l));
+                setIsProcessing(true);
+                setStatusMessage('A ler foto enviada...');
 
-                const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/i;
-                const phoneRegex = /(?:\+351\s?)?(?:[29]\d{2}[\s.-]?\d{3}[\s.-]?\d{3}|[29]\d{8})/;
+                try {
+                    const img = new Image();
+                    img.src = URL.createObjectURL(file);
+                    await img.decode();
 
-                let detectedEmail = '';
-                let detectedPhone = '';
-                let cleanTextLines = [];
+                    const canvas = canvasRef.current;
+                    const ctx = canvas.getContext('2d');
+                    canvas.width = img.width;
+                    canvas.height = img.height;
 
-                lines.forEach(line => {
-                    const emailMatch = line.match(emailRegex);
-                    const phoneMatch = line.match(phoneRegex);
+                    ctx.drawImage(img, 0, 0);
+                    const passes = await runOCR(enhanceForOCR(canvas));
 
-                    if (emailMatch && !detectedEmail) {
-                        detectedEmail = emailMatch[0];
-                    } else if (phoneMatch && !detectedPhone) {
-                        detectedPhone = phoneMatch[0];
+                    if (parseTextAndFill(passes) === 'full') {
+                        showToast('Dados extraídos da foto com sucesso!', 'success');
                     } else {
-                        // Ignorar palavras reservadas de ruído comuns em cartões
-                        const lower = line.toLowerCase();
-                        if (!lower.includes('tel') && 
-                            !lower.includes('email') && 
-                            !lower.includes('www.') && 
-                            !lower.includes('.pt') && 
-                            !lower.includes('.com')) {
-                            cleanTextLines.push(line);
-                        }
+                        showToast('Verifique os campos extraídos.', 'warning');
                     }
-                });
-
-                // Preencher o formulário apenas se existirem dados válidos
-                if (detectedPhone || detectedEmail || cleanTextLines.length >= 1) {
-                    setFormData(prev => ({
-                        nome: cleanTextLines[0] || prev.nome || 'Contacto Lido',
-                        empresa: cleanTextLines[1] || prev.empresa || '',
-                        telefone: detectedPhone || prev.telefone,
-                        email: detectedEmail || prev.email
-                    }));
-                    return true;
+                } catch (err) {
+                    showToast('Erro ao ler ficheiro.', 'error');
+                } finally {
+                    setIsProcessing(false);
                 }
+            };
 
-                return false;
+            // Aplica o resultado do extrator ao formulário
+            const parseTextAndFill = (passes) => {
+                const r = extractContactData(passes);
+                setRawText(r.rawText);
+                setAuto({ nome: !!r.nome, empresa: !!r.empresa, telefone: !!r.telefone, email: !!r.email });
+                console.log('OCR:', r);
+
+                if (!r.nome && !r.email && !r.telefone && !r.empresa) return false;
+
+                setFormData(prev => ({
+                    nome: r.nome || prev.nome || '',
+                    empresa: r.empresa || prev.empresa || '',
+                    telefone: r.telefone || prev.telefone,
+                    email: r.email || prev.email,
+                    notas: prev.notas || (r.cargo ? `Cargo: ${r.cargo}` : '')
+                }));
+
+                return (r.nome && (r.email || r.telefone)) ? 'full' : 'partial';
             };
 
             const handleSubmit = (e) => {
                 e.preventDefault();
                 if (!formData.nome) return;
-                setContacts([{ ...formData, id: Date.now() }, ...contacts]);
-                setFormData({ nome: '', empresa: '', telefone: '', email: '' });
-                setLastText('');
-                setConfidence(0);
+
+                if (editingId) {
+                    setContacts(contacts.map(c => c.id === editingId ? { ...formData, id: editingId, dataAtualizacao: new Date().toISOString() } : c));
+                    setEditingId(null);
+                    showToast('Contacto atualizado com sucesso!', 'success');
+                } else {
+                    setContacts([{ ...formData, id: Date.now(), dataCriacao: new Date().toISOString() }, ...contacts]);
+                    showToast('Contacto guardado com sucesso!', 'success');
+                }
+
+                setFormData({ nome: '', empresa: '', telefone: '', email: '', notas: '' });
+                setAuto({});
+            };
+
+            const handleEdit = (c) => {
+                setEditingId(c.id);
+                setFormData({
+                    nome: c.nome || '',
+                    empresa: c.empresa || '',
+                    telefone: c.telefone || '',
+                    email: c.email || '',
+                    notas: c.notas || ''
+                });
+                window.scrollTo({ top: 0, behavior: 'smooth' });
             };
 
             const handleDelete = (id) => {
-                setContacts(contacts.filter(c => c.id !== id));
+                if (confirm('Tem a certeza que deseja eliminar este contacto?')) {
+                    setContacts(contacts.filter(c => c.id !== id));
+                    showToast('Contacto eliminado.', 'info');
+                }
+            };
+
+            // Exportações Profissionais
+            const exportToCSV = () => {
+                if (contacts.length === 0) return showToast('Sem contactos para exportar.', 'warning');
+                
+                const headers = "Nome,Empresa,Telefone,Email,Notas\n";
+                const esc = v => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+                const rows = contacts.map(c => [c.nome, c.empresa, c.telefone, c.email, c.notas].map(esc).join(',')).join("\n");
+                const blob = new Blob(['\uFEFF' + headers + rows], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `contactos_PED_2026_${new Date().toISOString().slice(0,10)}.csv`;
+                a.click();
+                showToast('Ficheiro CSV exportado!', 'success');
+            };
+
+            const exportToVCard = (c) => {
+                const vcard = `BEGIN:VCARD\nVERSION:3.0\nN:${c.nome};;;;\nFN:${c.nome}\nORG:${c.empresa}\nTEL;TYPE=CELL:${c.telefone}\nEMAIL:${c.email}\nEND:VCARD`;
+                const blob = new Blob([vcard], { type: 'text/vcard;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${c.nome.replace(/\s+/g, '_')}.vcf`;
+                a.click();
+                showToast(`vCard de ${c.nome} gerado!`, 'success');
             };
 
             const filteredContacts = contacts.filter(c =>
                 c.nome.toLowerCase().includes(search.toLowerCase()) ||
-                c.empresa.toLowerCase().includes(search.toLowerCase())
+                c.empresa.toLowerCase().includes(search.toLowerCase()) ||
+                c.email.toLowerCase().includes(search.toLowerCase())
             );
 
-            return (
-                <div class="max-w-4xl mx-auto p-4 md:p-6 space-y-6">
-                    <canvas ref={canvasRef} class="hidden"></canvas>
+            const empresasUnicas = new Set(contacts.map(c => c.empresa).filter(Boolean)).size;
 
-                    <header class="bg-slate-900 border border-slate-800 rounded-2xl p-5 flex justify-between items-center shadow-xl">
+            return (
+                <div class="max-w-5xl mx-auto p-4 md:p-8 space-y-6">
+                    <canvas ref={canvasRef} class="hidden"></canvas>
+                    <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" class="hidden" />
+
+                    {/* Toast Notification system */}
+                    {toast && (
+                        <div class={`fixed bottom-5 right-5 z-50 px-4 py-3 rounded-xl shadow-2xl border text-xs font-semibold flex items-center gap-2.5 fade-in backdrop-blur ${
+                            toast.type === 'success' ? 'bg-emerald-950 border-emerald-500 text-emerald-200' :
+                            toast.type === 'warning' ? 'bg-amber-950 border-amber-500 text-amber-200' :
+                            toast.type === 'error' ? 'bg-red-950 border-red-500 text-red-200' : 'bg-slate-900 border-slate-700 text-slate-200'
+                        }`}>
+                            <i class={`fa-solid ${toast.type === 'success' ? 'fa-circle-check text-emerald-400' : 'fa-circle-info'}`}></i>
+                            {toast.msg}
+                        </div>
+                    )}
+
+                    {/* Cabeçalho do Sistema */}
+                    <header class="bg-slate-900/70 ring-1 ring-white/10 backdrop-blur-xl rounded-2xl p-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 shadow-2xl">
                         <div>
-                            <h1 class="text-xl font-bold text-white flex items-center gap-2.5">
-                                <i class="fa-solid fa-address-card text-indigo-400"></i> Gestão Inteligente de Contactos
-                            </h1>
-                            <p class="text-xs text-slate-400 mt-1">PED-2026-001 • Scanner Profissional com Controlo de Confiança</p>
+                            <div class="flex items-center gap-2">
+                                <span class="px-2.5 py-0.5 rounded-md bg-indigo-500/10 text-indigo-400 text-[10px] font-mono font-bold tracking-wider border border-indigo-500/20">PED-2026-001</span>
+                                <span class="px-2.5 py-0.5 rounded-md bg-emerald-500/10 text-emerald-400 text-[10px] font-mono font-bold tracking-wider border border-emerald-500/20">V3.0 ENTERPRISE</span>
+                            </div>
+                            <h1 class="text-2xl md:text-3xl font-extrabold tracking-tight mt-2 bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">Gestão Inteligente de Contactos</h1>
+                            <p class="text-xs text-slate-400 mt-0.5">Extração OCR e Gestão Empresarial de Cartões de Visita</p>
+                        </div>
+
+                        {/* Estatísticas Rápidas */}
+                        <div class="flex gap-3 w-full md:w-auto">
+                            <div class="bg-slate-950/60 ring-1 ring-white/10 rounded-xl px-5 py-3 text-center flex-1 md:flex-initial min-w-[110px]">
+                                <span class="text-xs text-slate-400 block font-medium"><i class="fa-solid fa-user-group text-indigo-400/80 mr-1.5"></i>Contactos</span>
+                                <span class="text-2xl font-bold text-indigo-400">{contacts.length}</span>
+                            </div>
+                            <div class="bg-slate-950/60 ring-1 ring-white/10 rounded-xl px-5 py-3 text-center flex-1 md:flex-initial min-w-[110px]">
+                                <span class="text-xs text-slate-400 block font-medium"><i class="fa-solid fa-building text-emerald-400/80 mr-1.5"></i>Empresas</span>
+                                <span class="text-2xl font-bold text-emerald-400">{empresasUnicas}</span>
+                            </div>
                         </div>
                     </header>
 
-                    <div class="grid md:grid-cols-2 gap-6">
-                        {/* Painel do Formulário & Leitor */}
-                        <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-xl space-y-4">
-                            <h2 class="text-md font-semibold text-slate-200 flex items-center gap-2">
-                                <i class="fa-solid fa-user-plus text-indigo-400"></i> Registar Contacto
-                            </h2>
+                    {/* Alerta de Permissão de Câmara */}
+                    {permissionError && (
+                        <div class="bg-amber-500/10 border border-amber-500/30 p-4 rounded-2xl flex items-start gap-3">
+                            <i class="fa-solid fa-lock text-amber-400 text-base mt-0.5"></i>
+                            <div class="text-xs space-y-1">
+                                <h3 class="font-semibold text-amber-300">Permissão de Câmara Bloqueada</h3>
+                                <p class="text-slate-300">Para utilizar a leitura em tempo real, ativa o acesso à câmara nas definições do teu navegador (ícone de cadeado na barra de endereço).</p>
+                            </div>
+                        </div>
+                    )}
+
+                    <div class="grid md:grid-cols-12 gap-6">
+                        {/* Formulário & Câmara */}
+                        <div class="md:col-span-6 bg-slate-900/70 ring-1 ring-white/10 backdrop-blur p-6 rounded-2xl shadow-2xl shadow-black/30 space-y-5">
+                            <div class="flex justify-between items-center">
+                                <h2 class="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
+                                    <i class="fa-solid fa-address-card text-indigo-400"></i> {editingId ? 'Editar Contacto' : 'Novo Contacto'}
+                                </h2>
+                                {editingId && (
+                                    <button 
+                                        type="button" 
+                                        onClick={() => { setEditingId(null); setFormData({ nome: '', empresa: '', telefone: '', email: '', notas: '' }); }}
+                                        class="text-xs text-slate-400 hover:text-white underline"
+                                    >
+                                        Cancelar Edição
+                                    </button>
+                                )}
+                            </div>
 
                             {!isCameraActive ? (
-                                <button
-                                    type="button"
-                                    disabled={!ocrReady}
-                                    onClick={() => startCamera()}
-                                    class="w-full py-3.5 px-4 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-semibold rounded-xl flex items-center justify-center gap-2.5 transition-all shadow-lg active:scale-95"
-                                >
-                                    <i class="fa-solid fa-camera"></i> 
-                                    {ocrReady ? 'Abrir Câmara' : 'A carregar motor...'}
-                                </button>
+                                <div class="grid grid-cols-2 gap-3">
+                                    <button
+                                        type="button"
+                                        disabled={!ocrReady}
+                                        onClick={() => startCamera()}
+                                        class="py-3 px-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold rounded-xl flex items-center justify-center gap-2 text-xs transition shadow-lg active:scale-95"
+                                    >
+                                        <i class="fa-solid fa-camera"></i> Abrir Câmara
+                                    </button>
+                                    <button
+                                        type="button"
+                                        disabled={!ocrReady}
+                                        onClick={() => fileInputRef.current && fileInputRef.current.click()}
+                                        class="py-3 px-3 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 font-semibold rounded-xl flex items-center justify-center gap-2 text-xs border border-slate-700 transition active:scale-95"
+                                    >
+                                        <i class="fa-solid fa-upload"></i> Carregar Foto
+                                    </button>
+                                </div>
                             ) : (
-                                <div class="space-y-3 bg-slate-950 p-3 rounded-xl border border-slate-800">
+                                <div class="space-y-3 bg-slate-950 p-3.5 rounded-xl border border-slate-800">
                                     {videoDevices.length > 1 && (
-                                        <div>
-                                            <select
-                                                value={selectedDeviceId}
-                                                onChange={(e) => {
-                                                    setSelectedDeviceId(e.target.value);
-                                                    startCamera(e.target.value);
-                                                }}
-                                                class="w-full bg-slate-900 border border-slate-700 text-xs text-slate-200 rounded-lg p-2 focus:outline-none"
-                                            >
-                                                {videoDevices.map((dev, idx) => (
-                                                    <option key={dev.deviceId} value={dev.deviceId}>
-                                                        {dev.label || `Câmara ${idx + 1}`}
-                                                    </option>
-                                                ))}
-                                            </select>
-                                        </div>
+                                        <select
+                                            value={selectedDeviceId}
+                                            onChange={(e) => {
+                                                setSelectedDeviceId(e.target.value);
+                                                startCamera(e.target.value);
+                                            }}
+                                            class="w-full bg-slate-900 border border-slate-700 text-xs text-slate-200 rounded-lg p-2 focus:outline-none"
+                                        >
+                                            {videoDevices.map((dev, idx) => (
+                                                <option key={dev.deviceId} value={dev.deviceId}>
+                                                    {dev.label || `Câmara ${idx + 1}`}
+                                                </option>
+                                            ))}
+                                        </select>
                                     )}
 
-                                    {/* Visor da Câmara */}
                                     <div class="relative rounded-lg overflow-hidden bg-black aspect-video flex items-center justify-center">
                                         <video 
                                             ref={videoRef} 
@@ -356,34 +780,53 @@
                                             playsInline 
                                             muted
                                             style={{
-                                                transform: `rotate(${rotation}deg)`,
+                                                transform: `rotate(${rotation}deg) scaleX(${isMirrored ? -1 : 1})`,
                                                 transition: 'transform 0.3s ease'
                                             }}
                                             class="w-full h-full object-cover"
                                         ></video>
                                         
-                                        {/* Moldura Guia */}
-                                        <div class="absolute inset-4 border-2 border-indigo-400/80 rounded-lg pointer-events-none flex flex-col justify-between p-2">
-                                            {isProcessing && (
-                                                <div class="w-full h-1 bg-indigo-400 shadow-[0_0_12px_#818cf8] animate-pulse"></div>
-                                            )}
+                                        <div class="absolute w-[85%] h-[65%] rounded-lg pointer-events-none shadow-[0_0_0_9999px_rgba(2,6,23,0.55)]">
+                                            <span class="absolute -top-px -left-px w-6 h-6 border-t-[3px] border-l-[3px] border-indigo-400 rounded-tl-lg"></span>
+                                            <span class="absolute -top-px -right-px w-6 h-6 border-t-[3px] border-r-[3px] border-indigo-400 rounded-tr-lg"></span>
+                                            <span class="absolute -bottom-px -left-px w-6 h-6 border-b-[3px] border-l-[3px] border-indigo-400 rounded-bl-lg"></span>
+                                            <span class="absolute -bottom-px -right-px w-6 h-6 border-b-[3px] border-r-[3px] border-indigo-400 rounded-br-lg"></span>
+                                            {isProcessing && <div class="scanline absolute left-2 right-2 h-0.5 bg-indigo-400 shadow-[0_0_14px_#818cf8]"></div>}
+                                            <p class="absolute bottom-1.5 inset-x-0 text-center text-[10px] text-slate-300/80">Enquadra o cartão dentro da moldura</p>
                                         </div>
 
-                                        {/* Botão de Rotação 180º */}
-                                        <button
-                                            type="button"
-                                            onClick={() => setRotation((prev) => (prev + 180) % 360)}
-                                            class="absolute top-2 right-2 bg-slate-900/90 hover:bg-slate-800 text-white px-2.5 py-1.5 rounded-lg backdrop-blur-md border border-slate-700 text-xs flex items-center gap-1.5"
-                                            title="Girar 180º (Para ler na mesa)"
-                                        >
-                                            <i class="fa-solid fa-arrows-rotate"></i> {rotation}º
-                                        </button>
+                                        <div class="absolute top-2 right-2 flex gap-1.5">
+                                            <button
+                                                type="button"
+                                                onClick={() => setIsMirrored(prev => !prev)}
+                                                class={`px-2.5 py-1.5 rounded-lg backdrop-blur-md border text-xs font-semibold ${
+                                                    isMirrored ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-900/90 border-slate-700 text-slate-300'
+                                                }`}
+                                            >
+                                                <i class="fa-solid fa-right-left"></i> Espelho
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => setRotation((prev) => (prev + 180) % 360)}
+                                                class="bg-slate-900/90 hover:bg-slate-800 text-white px-2.5 py-1.5 rounded-lg backdrop-blur-md border border-slate-700 text-xs flex items-center gap-1.5"
+                                            >
+                                                <i class="fa-solid fa-arrows-rotate"></i> {rotation}º
+                                            </button>
+                                        </div>
                                     </div>
 
-                                    {/* Barra de Ações e Estado */}
-                                    <div class="flex items-center justify-between text-xs px-1 pt-1">
-                                        <span class={`font-medium flex items-center gap-2 ${confidence >= 60 ? 'text-emerald-400' : 'text-indigo-400'}`}>
-                                            <i class={`fa-solid ${isProcessing ? 'fa-spinner fa-spin' : 'fa-shield-halved'}`}></i>
+                                    <button
+                                        type="button"
+                                        disabled={isProcessing}
+                                        onClick={captureAndProcess}
+                                        class="w-full py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold rounded-xl text-xs transition flex items-center justify-center gap-2 shadow-lg active:scale-95"
+                                    >
+                                        <i class="fa-solid fa-camera"></i> {isProcessing ? 'A extrair dados...' : 'Tirar Foto e Digitalizar'}
+                                    </button>
+
+                                    <div class="flex items-center justify-between text-xs px-1">
+                                        <span class="text-indigo-400 font-medium flex items-center gap-2">
+                                            <i class={`fa-solid ${isProcessing ? 'fa-spinner fa-spin' : 'fa-circle-info'}`}></i>
                                             {statusMessage}
                                         </span>
 
@@ -395,122 +838,176 @@
                                             Fechar
                                         </button>
                                     </div>
-
-                                    {/* Botão Manual de Alta Precisão */}
-                                    <button
-                                        type="button"
-                                        onClick={() => processFrame(true)}
-                                        disabled={isProcessing}
-                                        class="w-full py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition flex items-center justify-center gap-2 shadow-md active:scale-95"
-                                    >
-                                        <i class="fa-solid fa-bolt"></i> Digitalizar Agora (Alta Precisão)
-                                    </button>
-
-                                    {lastText && (
-                                        <div class="p-2 bg-slate-900/90 border border-slate-800 rounded-lg text-[10px] text-slate-400 font-mono break-all max-h-16 overflow-y-auto">
-                                            <span class="text-slate-500 block text-[9px] uppercase font-sans">Texto Lido ({confidence}% Confiança):</span>
-                                            {lastText}
-                                        </div>
-                                    )}
                                 </div>
                             )}
 
-                            {/* Formulário com Confirmação/Edição */}
+                            {rawText && (
+                                <details class="bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs">
+                                    <summary class="cursor-pointer text-slate-300 font-medium">Texto lido pelo OCR (diagnóstico)</summary>
+                                    <pre class="mt-2 whitespace-pre-wrap break-words font-mono text-[11px] text-slate-400 max-h-48 overflow-y-auto">{rawText}</pre>
+                                </details>
+                            )}
+
+                            {Object.values(auto).some(Boolean) && (
+                                <div class="fade-in flex items-start gap-2.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-200 rounded-xl px-3.5 py-2.5 text-xs">
+                                    <i class="fa-solid fa-wand-magic-sparkles mt-0.5 text-emerald-400"></i>
+                                    <span>Campos com contorno verde foram preenchidos pelo OCR. Confirma-os antes de guardar.</span>
+                                </div>
+                            )}
+
                             <form onSubmit={handleSubmit} class="space-y-3 pt-2">
                                 <div>
-                                    <label class="text-xs text-slate-400 mb-1 block">Nome do Contacto *</label>
+                                    <label class="text-xs text-slate-400 mb-1 block font-medium">Nome do Contacto *</label>
                                     <input
                                         type="text"
-                                        placeholder="Nome"
+                                        placeholder="Nome completo"
                                         value={formData.nome}
-                                        onChange={e => setFormData({ ...formData, nome: e.target.value })}
-                                        class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                                        onChange={e => { setFormData({ ...formData, nome: e.target.value }); setAuto(a => ({ ...a, nome: false })); }}
+                                        class={inputCls + (auto.nome ? ' autofill' : '')}
                                         required
                                     />
                                 </div>
 
                                 <div>
-                                    <label class="text-xs text-slate-400 mb-1 block">Empresa</label>
+                                    <label class="text-xs text-slate-400 mb-1 block font-medium">Empresa</label>
                                     <input
                                         type="text"
-                                        placeholder="Empresa"
+                                        placeholder="Nome da empresa"
                                         value={formData.empresa}
-                                        onChange={e => setFormData({ ...formData, empresa: e.target.value })}
-                                        class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                                        onChange={e => { setFormData({ ...formData, empresa: e.target.value }); setAuto(a => ({ ...a, empresa: false })); }}
+                                        class={inputCls + (auto.empresa ? ' autofill' : '')}
                                     />
                                 </div>
 
-                                <div class="grid grid-cols-2 gap-2">
+                                <div class="grid grid-cols-2 gap-3">
                                     <div>
-                                        <label class="text-xs text-slate-400 mb-1 block">Telefone</label>
+                                        <label class="text-xs text-slate-400 mb-1 block font-medium">Telefone</label>
                                         <input
                                             type="text"
-                                            placeholder="Telefone"
+                                            placeholder="Ex: 912345678"
                                             value={formData.telefone}
-                                            onChange={e => setFormData({ ...formData, telefone: e.target.value })}
-                                            class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                                            onChange={e => { setFormData({ ...formData, telefone: e.target.value }); setAuto(a => ({ ...a, telefone: false })); }}
+                                            class={inputCls + (auto.telefone ? ' autofill' : '')}
                                         />
                                     </div>
                                     <div>
-                                        <label class="text-xs text-slate-400 mb-1 block">Email</label>
+                                        <label class="text-xs text-slate-400 mb-1 block font-medium">Email</label>
                                         <input
                                             type="email"
-                                            placeholder="Email"
+                                            placeholder="Ex: contacto@empresa.pt"
                                             value={formData.email}
-                                            onChange={e => setFormData({ ...formData, email: e.target.value })}
-                                            class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                                            onChange={e => { setFormData({ ...formData, email: e.target.value }); setAuto(a => ({ ...a, email: false })); }}
+                                            class={inputCls + (auto.email ? ' autofill' : '')}
                                         />
                                     </div>
+                                </div>
+
+                                <div>
+                                    <label class="text-xs text-slate-400 mb-1 block font-medium">Notas / Observações</label>
+                                    <textarea
+                                        rows="2"
+                                        placeholder="Notas da reunião, cargos ou detalhes adicionais..."
+                                        value={formData.notas}
+                                        onChange={e => setFormData({ ...formData, notas: e.target.value })}
+                                        class={inputCls + ' resize-none'}
+                                    ></textarea>
                                 </div>
 
                                 <button
                                     type="submit"
-                                    class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-medium text-sm transition mt-2 flex items-center justify-center gap-2"
+                                    class="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-semibold text-sm transition mt-2 flex items-center justify-center gap-2 shadow-lg active:scale-95"
                                 >
-                                    <i class="fa-solid fa-floppy-disk"></i> Guardar Contacto
+                                    <i class="fa-solid fa-floppy-disk"></i> {editingId ? 'Guardar Alterações' : 'Guardar Contacto'}
                                 </button>
                             </form>
                         </div>
 
-                        {/* Lista de Contactos Registados */}
-                        <div class="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-xl space-y-4">
-                            <h2 class="text-md font-semibold text-slate-200 flex items-center gap-2">
-                                <i class="fa-solid fa-address-book text-indigo-400"></i> Contactos Registados ({contacts.length})
-                            </h2>
+                        {/* Lista de Contactos com Pesquisa e Exportação */}
+                        <div class="md:col-span-6 bg-slate-900/70 ring-1 ring-white/10 backdrop-blur p-6 rounded-2xl shadow-2xl shadow-black/30 space-y-4">
+                            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                                <h2 class="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
+                                    <i class="fa-solid fa-users text-indigo-400"></i> Contactos ({filteredContacts.length})
+                                </h2>
+
+                                <button
+                                    onClick={exportToCSV}
+                                    class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl text-xs font-medium flex items-center gap-2 transition"
+                                >
+                                    <i class="fa-solid fa-file-csv text-emerald-400"></i> Exportar CSV
+                                </button>
+                            </div>
 
                             <input
                                 type="text"
-                                placeholder="Pesquisar por nome ou empresa..."
+                                placeholder="Pesquisar por nome, empresa ou email..."
                                 value={search}
                                 onChange={e => setSearch(e.target.value)}
-                                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                                class={inputCls}
                             />
 
-                            <div class="space-y-3 max-h-[420px] overflow-y-auto pr-1">
+                            <div class="space-y-3 max-h-[500px] overflow-y-auto pr-1">
                                 {filteredContacts.length === 0 ? (
-                                    <div class="text-center py-12 text-slate-500 text-sm">
-                                        Nenhum contacto registado.
+                                    <div class="text-center py-16 text-slate-500 text-sm">
+                                        <i class="fa-regular fa-address-book text-4xl text-slate-700 mb-3 block"></i>
+                                        Nenhum contacto encontrado.
                                     </div>
                                 ) : (
                                     filteredContacts.map(c => (
-                                        <div key={c.id} class="bg-slate-950 border border-slate-800 p-4 rounded-xl space-y-2 relative group hover:border-slate-700 transition">
-                                            <button
-                                                onClick={() => handleDelete(c.id)}
-                                                class="absolute top-3 right-3 text-slate-500 hover:text-red-400 transition text-sm"
-                                                title="Eliminar"
-                                            >
-                                                <i class="fa-solid fa-trash"></i>
-                                            </button>
-                                            
-                                            <div>
-                                                <h3 class="font-semibold text-slate-100">{c.nome}</h3>
-                                                {c.empresa && <p class="text-xs text-indigo-400 font-medium">{c.empresa}</p>}
+                                        <div key={c.id} class="bg-slate-950/60 ring-1 ring-white/5 p-4 rounded-xl space-y-2 relative group hover:ring-indigo-500/40 hover:-translate-y-0.5 transition fade-in">
+                                            <div class="flex justify-between items-start pr-12">
+                                                <div class="flex items-center gap-3 min-w-0">
+                                                    <div class="w-10 h-10 shrink-0 rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center text-sm font-bold text-white shadow-lg shadow-indigo-900/40">{initials(c.nome)}</div>
+                                                    <div class="min-w-0">
+                                                        <h3 class="font-bold text-slate-100 text-base truncate">{c.nome}</h3>
+                                                        {c.empresa && <p class="text-xs text-indigo-400 font-medium truncate">{c.empresa}</p>}
+                                                    </div>
+                                                </div>
+
+                                                {/* Ações de Edição/Eliminação */}
+                                                <div class="absolute top-3 right-3 flex items-center gap-2">
+                                                    <button
+                                                        onClick={() => exportToVCard(c)}
+                                                        class="text-slate-500 hover:text-emerald-400 transition text-xs p-1"
+                                                        title="Descarregar vCard (.vcf)"
+                                                    >
+                                                        <i class="fa-solid fa-address-card"></i>
+                                                    </button>
+                                                    <button
+                                                        onClick={() => handleEdit(c)}
+                                                        class="text-slate-500 hover:text-indigo-400 transition text-xs p-1"
+                                                        title="Editar"
+                                                    >
+                                                        <i class="fa-solid fa-pen"></i>
+                                                    </button>
+                                                    <button
+                                                        onClick={() => handleDelete(c.id)}
+                                                        class="text-slate-500 hover:text-red-400 transition text-xs p-1"
+                                                        title="Eliminar"
+                                                    >
+                                                        <i class="fa-solid fa-trash"></i>
+                                                    </button>
+                                                </div>
                                             </div>
 
-                                            <div class="text-xs text-slate-400 space-y-1 pt-1 border-t border-slate-800/80">
-                                                {c.telefone && <p><i class="fa-solid fa-phone text-slate-500 w-4"></i> {c.telefone}</p>}
-                                                {c.email && <p><i class="fa-solid fa-envelope text-slate-500 w-4"></i> {c.email}</p>}
+                                            {/* Ligações Rápidas (Chamada / Email) */}
+                                            <div class="text-xs text-slate-400 space-y-1 pt-2 border-t border-slate-800/80 grid grid-cols-1 sm:grid-cols-2 gap-1">
+                                                {c.telefone && (
+                                                    <a href={`tel:${c.telefone}`} class="hover:text-slate-200 transition flex items-center gap-1.5 truncate">
+                                                        <i class="fa-solid fa-phone text-slate-500 w-3.5"></i> {c.telefone}
+                                                    </a>
+                                                )}
+                                                {c.email && (
+                                                    <a href={`mailto:${c.email}`} class="hover:text-slate-200 transition flex items-center gap-1.5 truncate">
+                                                        <i class="fa-solid fa-envelope text-slate-500 w-3.5"></i> {c.email}
+                                                    </a>
+                                                )}
                                             </div>
+
+                                            {c.notas && (
+                                                <p class="text-[11px] text-slate-500 pt-1 italic border-t border-slate-900">
+                                                    "{c.notas}"
+                                                </p>
+                                            )}
                                         </div>
                                     ))
                                 )}
