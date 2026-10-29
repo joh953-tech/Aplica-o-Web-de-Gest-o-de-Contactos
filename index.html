@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="pt">
 <head>
@@ -9,6 +10,7 @@
     <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <script src="https://unpkg.com/tesseract.js@5/dist/tesseract.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -27,11 +29,13 @@
     <script type="text/babel">
         const { useState, useRef, useEffect } = React;
 
+        // CREDENCIAIS SUPABASE
+        const SUPABASE_URL = 'https://ntgjarmnqoyvxghgqrhj.supabase.co'; 
+        const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im50Z2phcm1ucW95dnhnaGdxcmhqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMwMjEyNDAsImV4cCI6MjEwODU5NzI0MH0.tIZFe0t-J8JgXMb2pAhlTkOqCVvBGH2D_B5b444ioUM';
+        const supabaseClient = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
         // ===== Pré-processamento e extração de dados de cartões de visita =====
 
-        // Redimensiona, converte para cinzento e estica o contraste.
-        // NÃO binariza: o Tesseract já faz a sua própria binarização, bem melhor com texto pequeno
-        // (o limiar de Otsu global apagava as letras finas do nome e do email e só preservava os números grandes).
         function enhanceForOCR(src) {
             const targetW = 2200;
             const scale = Math.min(3, Math.max(0.4, targetW / src.width));
@@ -62,7 +66,7 @@
             for (let t = 255; t >= 0; t--) { acc += hist[t]; if (acc >= total * 0.01) { hi = t; break; } }
             if (hi - lo < 30) { lo = Math.max(0, lo - 15); hi = Math.min(255, hi + 15); }
             const range = Math.max(1, hi - lo);
-            const invert = mean < 110; // cartão escuro com texto claro -> inverter
+            const invert = mean < 110;
 
             for (let i = 0; i < d.length; i += 4) {
                 let v = ((d[i] - lo) * 255) / range;
@@ -75,7 +79,6 @@
             return out;
         }
 
-        // Binarização adaptativa (limiar local): ao contrário do Otsu global, aguenta sombras e luz desigual
         function adaptiveBinarize(src) {
             const w = src.width, hgt = src.height;
             const c = document.createElement('canvas');
@@ -134,10 +137,9 @@
                 .replace(/\(\s*(?:at|a)\s*\)|\[\s*at\s*\]/gi, '@')
                 .replace(/\s*@\s*/g, '@');
             if (!t.includes('@')) return [];
-            // 1.º tenta com os espaços originais (evita colar o email ao texto seguinte), 2.º sem espaços
             const candidates = [t, t.replace(/\s+/g, '')];
             for (const cand of candidates) {
-                const fixed = cand.replace(/(@[a-z0-9.\-]*),([a-z]{2,4})(?![a-z])/i, '$1.$2'); // "empresa,pt" -> "empresa.pt"
+                const fixed = cand.replace(/(@[a-z0-9.\-]*),([a-z]{2,4})(?![a-z])/i, '$1.$2');
                 const m = fixed.match(EMAIL_RE);
                 if (m) return m.map(x => x.toLowerCase());
             }
@@ -180,12 +182,10 @@
         }
 
         const inputCls = 'w-full bg-slate-950/70 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 transition';
-        const initials = (n) => (n || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('');
 
         function extractContactData(passes) {
             const rawText = passes.map((p, i) => `--- passagem ${i + 1}${p.aux ? ' (email/telefone)' : ''} ---\n${(p.text || '').trim()}`).join('\n\n');
 
-            // Linhas com altura relativa (texto maior => nome / empresa)
             const entries = [];
             passes.filter(p => !p.aux).forEach(data => {
                 let lines = (data.lines || []).map(l => ({
@@ -209,12 +209,10 @@
             const lines = Array.from(byKey.values());
             const allTexts = passes.flatMap(p => (p.text || '').split('\n')).map(t => t.trim()).filter(Boolean);
 
-            // ---- Email (o mais repetido nas duas passagens) ----
             const emailCount = new Map();
             allTexts.forEach(t => findEmails(t).forEach(e => emailCount.set(e, (emailCount.get(e) || 0) + 1)));
             let foundEmail = Array.from(emailCount.entries()).sort((a, b) => b[1] - a[1]).map(x => x[0])[0] || '';
 
-            // Validar o domínio do email com o site do cartão (corrige 1-2 letras mal lidas)
             const siteM = allTexts.map(t => t.match(/www\.([a-z0-9\-]+)\.[a-z]{2,}/i)).find(Boolean);
             if (foundEmail && siteM) {
                 const siteRoot = siteM[1].toLowerCase();
@@ -225,7 +223,6 @@
                 }
             }
 
-            // ---- Telefone (preferência: mais repetido, depois telemóvel) ----
             const phoneMap = new Map();
             allTexts.forEach(t => findPhones(t).forEach(p => {
                 const e = phoneMap.get(p.text) || { ...p, count: 0 };
@@ -243,7 +240,6 @@
                 }
             }
 
-            // ---- Pistas a partir do email ----
             const local = foundEmail ? stripAccents(foundEmail.split('@')[0]) : '';
             const domainRoot = foundEmail ? stripAccents(foundEmail.split('@')[1]).split('.')[0] : '';
             const domainUseful = domainRoot.length >= 3 && !GENERIC_PROVIDERS.has(domainRoot);
@@ -268,7 +264,6 @@
                 return { text: t, words, main };
             };
 
-            // ---- Nome ----
             let name = '';
             let nameLineIdx = -1;
             let bestNameScore = -Infinity;
@@ -296,7 +291,6 @@
             });
             if (bestNameScore < 3) { name = ''; nameLineIdx = -1; }
 
-            // Último recurso: deduzir do email (ex.: joao.silva@...)
             if (!name && local && /^[a-z]{2,}[._\-][a-z]{2,}$/.test(local)) {
                 const toks = local.split(/[._\-]/);
                 if (!toks.some(t => GENERIC_LOCAL.has(t))) {
@@ -304,7 +298,6 @@
                 }
             }
 
-            // ---- Cargo ----
             let cargo = '';
             for (const l of lines) {
                 if (isContactLine(l.text) || ADDR_RE.test(l.text)) continue;
@@ -314,7 +307,6 @@
                 }
             }
 
-            // ---- Empresa ----
             let empresa = '';
             let bestCompScore = -Infinity;
             lines.forEach((l, idx) => {
@@ -338,15 +330,12 @@
             return { nome: name, empresa, telefone: foundPhone, email: foundEmail, cargo, rawText };
         }
 
-
         function App() {
-            const [contacts, setContacts] = useState(() => {
-                const saved = localStorage.getItem('contacts_v2');
-                return saved ? JSON.parse(saved) : [];
-            });
-
+            const [contacts, setContacts] = useState([]);
             const [search, setSearch] = useState('');
+            const [filterCategory, setFilterCategory] = useState('Todos');
             const [editingId, setEditingId] = useState(null);
+
             const [isCameraActive, setIsCameraActive] = useState(false);
             const [stream, setStream] = useState(null);
             
@@ -358,16 +347,14 @@
             const [ocrReady, setOcrReady] = useState(false);
             const [isProcessing, setIsProcessing] = useState(false);
             const [statusMessage, setStatusMessage] = useState('Pronto a digitalizar.');
-            const [permissionError, setPermissionError] = useState(false);
             const [toast, setToast] = useState(null);
-            const [rawText, setRawText] = useState('');
-            const [auto, setAuto] = useState({});
 
             const [formData, setFormData] = useState({
                 nome: '',
                 empresa: '',
                 telefone: '',
                 email: '',
+                tipo_contacto: 'Potencial Cliente',
                 notas: ''
             });
 
@@ -376,16 +363,25 @@
             const fileInputRef = useRef(null);
             const workerRef = useRef(null);
 
+            const fetchContacts = async () => {
+                if (!supabaseClient) return;
+                try {
+                    const { data, error } = await supabaseClient.from('contactos').select('*').order('created_at', { ascending: false });
+                    if (!error && data) setContacts(data);
+                } catch (err) {
+                    console.error("Erro ao carregar do Supabase:", err);
+                }
+            };
+
             useEffect(() => {
-                localStorage.setItem('contacts_v2', JSON.stringify(contacts));
-            }, [contacts]);
+                fetchContacts();
+            }, []);
 
             const showToast = (msg, type = 'info') => {
                 setToast({ msg, type });
                 setTimeout(() => setToast(null), 3000);
             };
 
-            // Inicializar o Tesseract OCR
             useEffect(() => {
                 async function initOCR() {
                     try {
@@ -429,8 +425,6 @@
 
             const startCamera = async (deviceId = selectedDeviceId) => {
                 stopCamera();
-                setPermissionError(false);
-
                 try {
                     const constraints = {
                         video: deviceId 
@@ -439,20 +433,13 @@
                     };
 
                     const newStream = await navigator.mediaDevices.getUserMedia(constraints);
-                    try {
-                        const track = newStream.getVideoTracks()[0];
-                        const caps = track.getCapabilities ? track.getCapabilities() : {};
-                        if (caps.focusMode && caps.focusMode.includes('continuous')) {
-                            await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
-                        }
-                    } catch (e) { /* focagem contínua não suportada */ }
                     setStream(newStream);
                     setIsCameraActive(true);
                     setStatusMessage('Enquadra o cartão e clica no botão.');
                     loadVideoDevices();
                 } catch (err) {
-                    console.error("Erro de permissão:", err);
-                    setPermissionError(true);
+                    console.error("Erro de câmara:", err);
+                    showToast("Erro ao abrir a câmara", "error");
                     setIsCameraActive(false);
                 }
             };
@@ -466,8 +453,6 @@
                 setIsProcessing(false);
             };
 
-            // 4 passagens que "votam" entre si: texto disperso, bloco, imagem binarizada localmente
-            // e uma passagem restrita a caracteres de email/telefone (só usada para esses campos)
             const runOCR = async (gray) => {
                 const worker = workerRef.current;
                 const bin = adaptiveBinarize(gray);
@@ -480,7 +465,7 @@
                 ];
                 const passes = [];
                 for (let i = 0; i < jobs.length; i++) {
-                    setStatusMessage(`A ler o cartão... passagem ${i + 1}/${jobs.length}`);
+                    setStatusMessage(`A ler o cartão localmente... passagem ${i + 1}/${jobs.length}`);
                     await worker.setParameters({ tessedit_pageseg_mode: jobs[i].psm, tessedit_char_whitelist: jobs[i].wl || '' });
                     const { data } = await worker.recognize(jobs[i].img);
                     data.aux = !!jobs[i].aux;
@@ -493,11 +478,10 @@
             const captureAndProcess = async () => {
                 if (!videoRef.current || !canvasRef.current || !workerRef.current) return;
                 const video = videoRef.current;
-                
                 if (video.readyState !== video.HAVE_ENOUGH_DATA) return;
 
                 setIsProcessing(true);
-                setStatusMessage('A analisar cartão e dados de contacto...');
+                setStatusMessage('A analisar cartão localmente...');
 
                 try {
                     const canvas = canvasRef.current;
@@ -516,7 +500,6 @@
 
                     ctx.save();
                     ctx.translate(cropW / 2, cropH / 2);
-                    
                     if (rotation !== 0) ctx.rotate((rotation * Math.PI) / 180);
                     if (isMirrored) ctx.scale(-1, 1);
 
@@ -529,7 +512,7 @@
                         showToast('Cartão lido com sucesso!', 'success');
                         setTimeout(() => stopCamera(), 400);
                     } else if (result === 'partial') {
-                        showToast('Leitura parcial: confirma os campos ou tira outra foto.', 'warning');
+                        showToast('Leitura parcial: confirma os campos.', 'warning');
                     } else {
                         showToast('Não foi possível reconhecer dados claros.', 'warning');
                     }
@@ -562,7 +545,7 @@
                     const passes = await runOCR(enhanceForOCR(canvas));
 
                     if (parseTextAndFill(passes) === 'full') {
-                        showToast('Dados extraídos da foto com sucesso!', 'success');
+                        showToast('Dados extraídos da foto!', 'success');
                     } else {
                         showToast('Verifique os campos extraídos.', 'warning');
                     }
@@ -573,41 +556,43 @@
                 }
             };
 
-            // Aplica o resultado do extrator ao formulário
             const parseTextAndFill = (passes) => {
                 const r = extractContactData(passes);
-                setRawText(r.rawText);
-                setAuto({ nome: !!r.nome, empresa: !!r.empresa, telefone: !!r.telefone, email: !!r.email });
-                console.log('OCR:', r);
-
                 if (!r.nome && !r.email && !r.telefone && !r.empresa) return false;
 
                 setFormData(prev => ({
+                    ...prev,
                     nome: r.nome || prev.nome || '',
                     empresa: r.empresa || prev.empresa || '',
-                    telefone: r.telefone || prev.telefone,
-                    email: r.email || prev.email,
+                    telefone: r.telefone || prev.telefone || '',
+                    email: r.email || prev.email || '',
                     notas: prev.notas || (r.cargo ? `Cargo: ${r.cargo}` : '')
                 }));
 
                 return (r.nome && (r.email || r.telefone)) ? 'full' : 'partial';
             };
 
-            const handleSubmit = (e) => {
+            const handleSubmit = async (e) => {
                 e.preventDefault();
-                if (!formData.nome) return;
+                if (!formData.nome) return showToast('Introduza o nome do contacto.', 'warning');
 
-                if (editingId) {
-                    setContacts(contacts.map(c => c.id === editingId ? { ...formData, id: editingId, dataAtualizacao: new Date().toISOString() } : c));
-                    setEditingId(null);
-                    showToast('Contacto atualizado com sucesso!', 'success');
-                } else {
-                    setContacts([{ ...formData, id: Date.now(), dataCriacao: new Date().toISOString() }, ...contacts]);
-                    showToast('Contacto guardado com sucesso!', 'success');
+                try {
+                    if (editingId) {
+                        const { error } = await supabaseClient.from('contactos').update(formData).eq('id', editingId);
+                        if (error) throw error;
+                        setEditingId(null);
+                        showToast('Contacto atualizado com sucesso!', 'success');
+                    } else {
+                        const { error } = await supabaseClient.from('contactos').insert([formData]);
+                        if (error) throw error;
+                        showToast('Contacto guardado com sucesso!', 'success');
+                    }
+
+                    setFormData({ nome: '', empresa: '', telefone: '', email: '', tipo_contacto: 'Potencial Cliente', notas: '' });
+                    fetchContacts();
+                } catch (err) {
+                    alert("Erro ao guardar no Supabase: " + err.message);
                 }
-
-                setFormData({ nome: '', empresa: '', telefone: '', email: '', notas: '' });
-                setAuto({});
             };
 
             const handleEdit = (c) => {
@@ -617,200 +602,146 @@
                     empresa: c.empresa || '',
                     telefone: c.telefone || '',
                     email: c.email || '',
+                    tipo_contacto: c.tipo_contacto || 'Potencial Cliente',
                     notas: c.notas || ''
                 });
                 window.scrollTo({ top: 0, behavior: 'smooth' });
             };
 
-            const handleDelete = (id) => {
-                if (confirm('Tem a certeza que deseja eliminar este contacto?')) {
-                    setContacts(contacts.filter(c => c.id !== id));
+            const handleDelete = async (id) => {
+                if (!confirm('Tem a certeza que deseja eliminar este contacto?')) return;
+                try {
+                    const { error } = await supabaseClient.from('contactos').delete().eq('id', id);
+                    if (error) throw error;
                     showToast('Contacto eliminado.', 'info');
+                    fetchContacts();
+                } catch (err) {
+                    alert("Erro ao eliminar: " + err.message);
                 }
             };
 
-            // Exportações Profissionais
             const exportToCSV = () => {
-                if (contacts.length === 0) return showToast('Sem contactos para exportar.', 'warning');
+                if (contacts.length === 0) return showToast("Sem contactos para exportar.", "warning");
                 
-                const headers = "Nome,Empresa,Telefone,Email,Notas\n";
-                const esc = v => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
-                const rows = contacts.map(c => [c.nome, c.empresa, c.telefone, c.email, c.notas].map(esc).join(',')).join("\n");
-                const blob = new Blob(['\uFEFF' + headers + rows], { type: 'text/csv;charset=utf-8;' });
+                const headers = "Nome,Empresa,Telefone,Email,Tipo de Contacto,Notas\n";
+                const rows = contacts.map(c => `"${c.nome || ''}","${c.empresa || ''}","${c.telefone || ''}","${c.email || ''}","${c.tipo_contacto || 'Potencial Cliente'}","${c.notas || ''}"`).join("\n");
+                const blob = new Blob([headers + rows], { type: 'text/csv;charset=utf-8;' });
                 const url = URL.createObjectURL(blob);
                 
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `contactos_PED_2026_${new Date().toISOString().slice(0,10)}.csv`;
+                a.download = `contactos_${new Date().toISOString().slice(0,10)}.csv`;
                 a.click();
-                showToast('Ficheiro CSV exportado!', 'success');
             };
 
-            const exportToVCard = (c) => {
-                const vcard = `BEGIN:VCARD\nVERSION:3.0\nN:${c.nome};;;;\nFN:${c.nome}\nORG:${c.empresa}\nTEL;TYPE=CELL:${c.telefone}\nEMAIL:${c.email}\nEND:VCARD`;
-                const blob = new Blob([vcard], { type: 'text/vcard;charset=utf-8;' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `${c.nome.replace(/\s+/g, '_')}.vcf`;
-                a.click();
-                showToast(`vCard de ${c.nome} gerado!`, 'success');
+            const filteredContacts = contacts.filter(c => {
+                const matchesSearch = c.nome?.toLowerCase().includes(search.toLowerCase()) ||
+                    c.empresa?.toLowerCase().includes(search.toLowerCase()) ||
+                    c.email?.toLowerCase().includes(search.toLowerCase());
+
+                const matchesCategory = filterCategory === 'Todos' || (c.tipo_contacto || 'Potencial Cliente') === filterCategory;
+
+                return matchesSearch && matchesCategory;
+            });
+
+            const getTypeBadge = (tipo) => {
+                switch(tipo) {
+                    case 'Cliente':
+                        return <span className="px-2 py-0.5 text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-md">Cliente</span>;
+                    case 'Fornecedor':
+                        return <span className="px-2 py-0.5 text-[10px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-md">Fornecedor</span>;
+                    default:
+                        return <span className="px-2 py-0.5 text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded-md">Potencial Cliente</span>;
+                }
             };
-
-            const filteredContacts = contacts.filter(c =>
-                c.nome.toLowerCase().includes(search.toLowerCase()) ||
-                c.empresa.toLowerCase().includes(search.toLowerCase()) ||
-                c.email.toLowerCase().includes(search.toLowerCase())
-            );
-
-            const empresasUnicas = new Set(contacts.map(c => c.empresa).filter(Boolean)).size;
 
             return (
-                <div class="max-w-5xl mx-auto p-4 md:p-8 space-y-6">
-                    <canvas ref={canvasRef} class="hidden"></canvas>
-                    <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" class="hidden" />
+                <div className="max-w-5xl mx-auto p-4 md:p-6 space-y-6">
+                    <canvas ref={canvasRef} className="hidden"></canvas>
+                    <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" className="hidden" />
 
-                    {/* Toast Notification system */}
                     {toast && (
-                        <div class={`fixed bottom-5 right-5 z-50 px-4 py-3 rounded-xl shadow-2xl border text-xs font-semibold flex items-center gap-2.5 fade-in backdrop-blur ${
-                            toast.type === 'success' ? 'bg-emerald-950 border-emerald-500 text-emerald-200' :
-                            toast.type === 'warning' ? 'bg-amber-950 border-amber-500 text-amber-200' :
-                            toast.type === 'error' ? 'bg-red-950 border-red-500 text-red-200' : 'bg-slate-900 border-slate-700 text-slate-200'
+                        <div className={`fixed bottom-5 right-5 px-4 py-3 rounded-xl border shadow-2xl text-xs font-semibold z-50 fade-in ${
+                            toast.type === 'success' ? 'bg-emerald-950 border-emerald-800 text-emerald-300' :
+                            toast.type === 'warning' ? 'bg-amber-950 border-amber-800 text-amber-300' :
+                            'bg-slate-900 border-slate-700 text-slate-200'
                         }`}>
-                            <i class={`fa-solid ${toast.type === 'success' ? 'fa-circle-check text-emerald-400' : 'fa-circle-info'}`}></i>
                             {toast.msg}
                         </div>
                     )}
 
-                    {/* Cabeçalho do Sistema */}
-                    <header class="bg-slate-900/70 ring-1 ring-white/10 backdrop-blur-xl rounded-2xl p-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 shadow-2xl">
+                    <header className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 backdrop-blur-md shadow-2xl flex justify-between items-center">
                         <div>
-                            <div class="flex items-center gap-2">
-                                <span class="px-2.5 py-0.5 rounded-md bg-indigo-500/10 text-indigo-400 text-[10px] font-mono font-bold tracking-wider border border-indigo-500/20">PED-2026-001</span>
-                                <span class="px-2.5 py-0.5 rounded-md bg-emerald-500/10 text-emerald-400 text-[10px] font-mono font-bold tracking-wider border border-emerald-500/20">V3.0 ENTERPRISE</span>
-                            </div>
-                            <h1 class="text-2xl md:text-3xl font-extrabold tracking-tight mt-2 bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">Gestão Inteligente de Contactos</h1>
-                            <p class="text-xs text-slate-400 mt-0.5">Extração OCR e Gestão Empresarial de Cartões de Visita</p>
+                            <h1 className="text-xl font-extrabold text-white flex items-center gap-2">
+                                <i className="fa-solid fa-address-book text-indigo-400"></i> Gestão de Contactos
+                            </h1>
+                            <p className="text-xs text-slate-400 mt-1">Reconhecimento OCR Local (Tesseract) & Persistência Cloud</p>
                         </div>
-
-                        {/* Estatísticas Rápidas */}
-                        <div class="flex gap-3 w-full md:w-auto">
-                            <div class="bg-slate-950/60 ring-1 ring-white/10 rounded-xl px-5 py-3 text-center flex-1 md:flex-initial min-w-[110px]">
-                                <span class="text-xs text-slate-400 block font-medium"><i class="fa-solid fa-user-group text-indigo-400/80 mr-1.5"></i>Contactos</span>
-                                <span class="text-2xl font-bold text-indigo-400">{contacts.length}</span>
-                            </div>
-                            <div class="bg-slate-950/60 ring-1 ring-white/10 rounded-xl px-5 py-3 text-center flex-1 md:flex-initial min-w-[110px]">
-                                <span class="text-xs text-slate-400 block font-medium"><i class="fa-solid fa-building text-emerald-400/80 mr-1.5"></i>Empresas</span>
-                                <span class="text-2xl font-bold text-emerald-400">{empresasUnicas}</span>
-                            </div>
-                        </div>
+                        <span className="text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 px-3 py-1 rounded-full font-mono">PED-2026-001</span>
                     </header>
 
-                    {/* Alerta de Permissão de Câmara */}
-                    {permissionError && (
-                        <div class="bg-amber-500/10 border border-amber-500/30 p-4 rounded-2xl flex items-start gap-3">
-                            <i class="fa-solid fa-lock text-amber-400 text-base mt-0.5"></i>
-                            <div class="text-xs space-y-1">
-                                <h3 class="font-semibold text-amber-300">Permissão de Câmara Bloqueada</h3>
-                                <p class="text-slate-300">Para utilizar a leitura em tempo real, ativa o acesso à câmara nas definições do teu navegador (ícone de cadeado na barra de endereço).</p>
-                            </div>
-                        </div>
-                    )}
-
-                    <div class="grid md:grid-cols-12 gap-6">
-                        {/* Formulário & Câmara */}
-                        <div class="md:col-span-6 bg-slate-900/70 ring-1 ring-white/10 backdrop-blur p-6 rounded-2xl shadow-2xl shadow-black/30 space-y-5">
-                            <div class="flex justify-between items-center">
-                                <h2 class="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
-                                    <i class="fa-solid fa-address-card text-indigo-400"></i> {editingId ? 'Editar Contacto' : 'Novo Contacto'}
+                    <div className="grid md:grid-cols-2 gap-6">
+                        <div className="bg-slate-900/60 border border-slate-800 p-5 rounded-2xl shadow-xl space-y-4">
+                            <div className="flex justify-between items-center">
+                                <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2">
+                                    <i className="fa-solid fa-user-plus text-indigo-400"></i> {editingId ? 'Editar Contacto' : 'Novo Contacto'}
                                 </h2>
                                 {editingId && (
                                     <button 
                                         type="button" 
-                                        onClick={() => { setEditingId(null); setFormData({ nome: '', empresa: '', telefone: '', email: '', notas: '' }); }}
-                                        class="text-xs text-slate-400 hover:text-white underline"
+                                        onClick={() => { setEditingId(null); setFormData({ nome: '', empresa: '', telefone: '', email: '', tipo_contacto: 'Potencial Cliente', notas: '' }); }}
+                                        className="text-xs text-slate-400 hover:text-white underline"
                                     >
-                                        Cancelar Edição
+                                        Cancelar
                                     </button>
                                 )}
                             </div>
 
                             {!isCameraActive ? (
-                                <div class="grid grid-cols-2 gap-3">
+                                <div className="grid grid-cols-2 gap-2">
                                     <button
                                         type="button"
-                                        disabled={!ocrReady}
                                         onClick={() => startCamera()}
-                                        class="py-3 px-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold rounded-xl flex items-center justify-center gap-2 text-xs transition shadow-lg active:scale-95"
+                                        className="py-3 px-3 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-xl flex items-center justify-center gap-2 text-xs transition shadow-lg active:scale-95"
                                     >
-                                        <i class="fa-solid fa-camera"></i> Abrir Câmara
+                                        <i className="fa-solid fa-camera"></i> Abrir Câmara
                                     </button>
                                     <button
                                         type="button"
-                                        disabled={!ocrReady}
-                                        onClick={() => fileInputRef.current && fileInputRef.current.click()}
-                                        class="py-3 px-3 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 font-semibold rounded-xl flex items-center justify-center gap-2 text-xs border border-slate-700 transition active:scale-95"
+                                        onClick={() => fileInputRef.current?.click()}
+                                        className="py-3 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-xl flex items-center justify-center gap-2 text-xs border border-slate-700 transition active:scale-95"
                                     >
-                                        <i class="fa-solid fa-upload"></i> Carregar Foto
+                                        <i className="fa-solid fa-upload"></i> Carregar Foto
                                     </button>
                                 </div>
                             ) : (
-                                <div class="space-y-3 bg-slate-950 p-3.5 rounded-xl border border-slate-800">
-                                    {videoDevices.length > 1 && (
-                                        <select
-                                            value={selectedDeviceId}
-                                            onChange={(e) => {
-                                                setSelectedDeviceId(e.target.value);
-                                                startCamera(e.target.value);
-                                            }}
-                                            class="w-full bg-slate-900 border border-slate-700 text-xs text-slate-200 rounded-lg p-2 focus:outline-none"
-                                        >
-                                            {videoDevices.map((dev, idx) => (
-                                                <option key={dev.deviceId} value={dev.deviceId}>
-                                                    {dev.label || `Câmara ${idx + 1}`}
-                                                </option>
-                                            ))}
-                                        </select>
-                                    )}
-
-                                    <div class="relative rounded-lg overflow-hidden bg-black aspect-video flex items-center justify-center">
+                                <div className="space-y-3 bg-slate-950 p-3 rounded-xl border border-slate-800 relative">
+                                    <div className="relative rounded-lg overflow-hidden bg-black aspect-video flex items-center justify-center">
                                         <video 
                                             ref={videoRef} 
                                             autoPlay 
                                             playsInline 
                                             muted
-                                            style={{
-                                                transform: `rotate(${rotation}deg) scaleX(${isMirrored ? -1 : 1})`,
-                                                transition: 'transform 0.3s ease'
-                                            }}
-                                            class="w-full h-full object-cover"
+                                            style={{ transform: `rotate(${rotation}deg) scaleX(${isMirrored ? -1 : 1})` }}
+                                            className="w-full h-full object-cover"
                                         ></video>
                                         
-                                        <div class="absolute w-[85%] h-[65%] rounded-lg pointer-events-none shadow-[0_0_0_9999px_rgba(2,6,23,0.55)]">
-                                            <span class="absolute -top-px -left-px w-6 h-6 border-t-[3px] border-l-[3px] border-indigo-400 rounded-tl-lg"></span>
-                                            <span class="absolute -top-px -right-px w-6 h-6 border-t-[3px] border-r-[3px] border-indigo-400 rounded-tr-lg"></span>
-                                            <span class="absolute -bottom-px -left-px w-6 h-6 border-b-[3px] border-l-[3px] border-indigo-400 rounded-bl-lg"></span>
-                                            <span class="absolute -bottom-px -right-px w-6 h-6 border-b-[3px] border-r-[3px] border-indigo-400 rounded-br-lg"></span>
-                                            {isProcessing && <div class="scanline absolute left-2 right-2 h-0.5 bg-indigo-400 shadow-[0_0_14px_#818cf8]"></div>}
-                                            <p class="absolute bottom-1.5 inset-x-0 text-center text-[10px] text-slate-300/80">Enquadra o cartão dentro da moldura</p>
-                                        </div>
+                                        {isProcessing && <div className="absolute inset-x-0 h-0.5 bg-indigo-500 scanline shadow-[0_0_8px_#6366f1]"></div>}
 
-                                        <div class="absolute top-2 right-2 flex gap-1.5">
-                                            <button
-                                                type="button"
-                                                onClick={() => setIsMirrored(prev => !prev)}
-                                                class={`px-2.5 py-1.5 rounded-lg backdrop-blur-md border text-xs font-semibold ${
-                                                    isMirrored ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-slate-900/90 border-slate-700 text-slate-300'
-                                                }`}
+                                        <div className="absolute top-2 right-2 flex gap-1.5">
+                                            <button 
+                                                type="button" 
+                                                onClick={() => setIsMirrored(!isMirrored)} 
+                                                className="bg-slate-900/90 text-slate-300 px-2 py-1 rounded border border-slate-700 text-xs"
                                             >
-                                                <i class="fa-solid fa-right-left"></i> Espelho
+                                                Espelho
                                             </button>
-                                            <button
-                                                type="button"
-                                                onClick={() => setRotation((prev) => (prev + 180) % 360)}
-                                                class="bg-slate-900/90 hover:bg-slate-800 text-white px-2.5 py-1.5 rounded-lg backdrop-blur-md border border-slate-700 text-xs flex items-center gap-1.5"
+                                            <button 
+                                                type="button" 
+                                                onClick={() => setRotation((r) => (r + 180) % 360)} 
+                                                className="bg-slate-900/90 text-slate-300 px-2 py-1 rounded border border-slate-700 text-xs"
                                             >
-                                                <i class="fa-solid fa-arrows-rotate"></i> {rotation}º
+                                                {rotation}º
                                             </button>
                                         </div>
                                     </div>
@@ -819,121 +750,106 @@
                                         type="button"
                                         disabled={isProcessing}
                                         onClick={captureAndProcess}
-                                        class="w-full py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold rounded-xl text-xs transition flex items-center justify-center gap-2 shadow-lg active:scale-95"
+                                        className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-xs transition flex items-center justify-center gap-2 shadow-lg active:scale-95 disabled:opacity-50"
                                     >
-                                        <i class="fa-solid fa-camera"></i> {isProcessing ? 'A extrair dados...' : 'Tirar Foto e Digitalizar'}
+                                        <i className="fa-solid fa-bolt"></i> {isProcessing ? 'A analisar localmente...' : 'Tirar Foto e Analisar'}
                                     </button>
 
-                                    <div class="flex items-center justify-between text-xs px-1">
-                                        <span class="text-indigo-400 font-medium flex items-center gap-2">
-                                            <i class={`fa-solid ${isProcessing ? 'fa-spinner fa-spin' : 'fa-circle-info'}`}></i>
-                                            {statusMessage}
-                                        </span>
-
-                                        <button
-                                            type="button"
-                                            onClick={stopCamera}
-                                            class="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs border border-slate-700"
-                                        >
-                                            Fechar
-                                        </button>
+                                    <div className="flex justify-between items-center text-xs">
+                                        <span className="text-indigo-400">{statusMessage}</span>
+                                        <button type="button" onClick={stopCamera} className="text-slate-400 hover:text-white underline">Fechar</button>
                                     </div>
                                 </div>
                             )}
 
-                            {rawText && (
-                                <details class="bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs">
-                                    <summary class="cursor-pointer text-slate-300 font-medium">Texto lido pelo OCR (diagnóstico)</summary>
-                                    <pre class="mt-2 whitespace-pre-wrap break-words font-mono text-[11px] text-slate-400 max-h-48 overflow-y-auto">{rawText}</pre>
-                                </details>
-                            )}
-
-                            {Object.values(auto).some(Boolean) && (
-                                <div class="fade-in flex items-start gap-2.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-200 rounded-xl px-3.5 py-2.5 text-xs">
-                                    <i class="fa-solid fa-wand-magic-sparkles mt-0.5 text-emerald-400"></i>
-                                    <span>Campos com contorno verde foram preenchidos pelo OCR. Confirma-os antes de guardar.</span>
-                                </div>
-                            )}
-
-                            <form onSubmit={handleSubmit} class="space-y-3 pt-2">
+                            <form onSubmit={handleSubmit} className="space-y-3 pt-2">
                                 <div>
-                                    <label class="text-xs text-slate-400 mb-1 block font-medium">Nome do Contacto *</label>
+                                    <label className="text-xs text-slate-400 mb-1 block">Nome do Contacto *</label>
                                     <input
                                         type="text"
-                                        placeholder="Nome completo"
                                         value={formData.nome}
-                                        onChange={e => { setFormData({ ...formData, nome: e.target.value }); setAuto(a => ({ ...a, nome: false })); }}
-                                        class={inputCls + (auto.nome ? ' autofill' : '')}
+                                        onChange={e => setFormData({ ...formData, nome: e.target.value })}
+                                        className={inputCls}
                                         required
                                     />
                                 </div>
 
-                                <div>
-                                    <label class="text-xs text-slate-400 mb-1 block font-medium">Empresa</label>
-                                    <input
-                                        type="text"
-                                        placeholder="Nome da empresa"
-                                        value={formData.empresa}
-                                        onChange={e => { setFormData({ ...formData, empresa: e.target.value }); setAuto(a => ({ ...a, empresa: false })); }}
-                                        class={inputCls + (auto.empresa ? ' autofill' : '')}
-                                    />
-                                </div>
-
-                                <div class="grid grid-cols-2 gap-3">
+                                <div className="grid grid-cols-2 gap-2">
                                     <div>
-                                        <label class="text-xs text-slate-400 mb-1 block font-medium">Telefone</label>
+                                        <label className="text-xs text-slate-400 mb-1 block">Empresa</label>
                                         <input
                                             type="text"
-                                            placeholder="Ex: 912345678"
+                                            value={formData.empresa}
+                                            onChange={e => setFormData({ ...formData, empresa: e.target.value })}
+                                            className={inputCls}
+                                        />
+                                    </div>
+
+                                    <div>
+                                        <label className="text-xs text-slate-400 mb-1 block">Tipo de Contacto *</label>
+                                        <select
+                                            value={formData.tipo_contacto}
+                                            onChange={e => setFormData({ ...formData, tipo_contacto: e.target.value })}
+                                            className={inputCls}
+                                        >
+                                            <option value="Potencial Cliente">Potencial Cliente</option>
+                                            <option value="Cliente">Cliente</option>
+                                            <option value="Fornecedor">Fornecedor</option>
+                                        </select>
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <label className="text-xs text-slate-400 mb-1 block">Telefone</label>
+                                        <input
+                                            type="text"
                                             value={formData.telefone}
-                                            onChange={e => { setFormData({ ...formData, telefone: e.target.value }); setAuto(a => ({ ...a, telefone: false })); }}
-                                            class={inputCls + (auto.telefone ? ' autofill' : '')}
+                                            onChange={e => setFormData({ ...formData, telefone: e.target.value })}
+                                            className={inputCls}
                                         />
                                     </div>
                                     <div>
-                                        <label class="text-xs text-slate-400 mb-1 block font-medium">Email</label>
+                                        <label className="text-xs text-slate-400 mb-1 block">Email</label>
                                         <input
                                             type="email"
-                                            placeholder="Ex: contacto@empresa.pt"
                                             value={formData.email}
-                                            onChange={e => { setFormData({ ...formData, email: e.target.value }); setAuto(a => ({ ...a, email: false })); }}
-                                            class={inputCls + (auto.email ? ' autofill' : '')}
+                                            onChange={e => setFormData({ ...formData, email: e.target.value })}
+                                            className={inputCls}
                                         />
                                     </div>
                                 </div>
 
                                 <div>
-                                    <label class="text-xs text-slate-400 mb-1 block font-medium">Notas / Observações</label>
+                                    <label className="text-xs text-slate-400 mb-1 block">Notas</label>
                                     <textarea
                                         rows="2"
-                                        placeholder="Notas da reunião, cargos ou detalhes adicionais..."
                                         value={formData.notas}
                                         onChange={e => setFormData({ ...formData, notas: e.target.value })}
-                                        class={inputCls + ' resize-none'}
+                                        className={`${inputCls} resize-none`}
                                     ></textarea>
                                 </div>
 
                                 <button
                                     type="submit"
-                                    class="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-semibold text-sm transition mt-2 flex items-center justify-center gap-2 shadow-lg active:scale-95"
+                                    className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-medium text-sm transition mt-2 flex items-center justify-center gap-2 shadow-lg active:scale-95"
                                 >
-                                    <i class="fa-solid fa-floppy-disk"></i> {editingId ? 'Guardar Alterações' : 'Guardar Contacto'}
+                                    <i className="fa-solid fa-floppy-disk"></i> {editingId ? 'Atualizar Contacto' : 'Guardar Contacto'}
                                 </button>
                             </form>
                         </div>
 
-                        {/* Lista de Contactos com Pesquisa e Exportação */}
-                        <div class="md:col-span-6 bg-slate-900/70 ring-1 ring-white/10 backdrop-blur p-6 rounded-2xl shadow-2xl shadow-black/30 space-y-4">
-                            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                                <h2 class="text-sm font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
-                                    <i class="fa-solid fa-users text-indigo-400"></i> Contactos ({filteredContacts.length})
+                        <div className="bg-slate-900/60 border border-slate-800 p-5 rounded-2xl shadow-xl space-y-4">
+                            <div className="flex justify-between items-center">
+                                <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2">
+                                    <i className="fa-solid fa-users text-indigo-400"></i> Contactos ({filteredContacts.length})
                                 </h2>
 
                                 <button
                                     onClick={exportToCSV}
-                                    class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl text-xs font-medium flex items-center gap-2 transition"
+                                    className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded-lg text-xs flex items-center gap-1.5 transition active:scale-95"
                                 >
-                                    <i class="fa-solid fa-file-csv text-emerald-400"></i> Exportar CSV
+                                    <i className="fa-solid fa-file-csv text-emerald-400"></i> Exportar
                                 </button>
                             </div>
 
@@ -942,72 +858,66 @@
                                 placeholder="Pesquisar por nome, empresa ou email..."
                                 value={search}
                                 onChange={e => setSearch(e.target.value)}
-                                class={inputCls}
+                                className={inputCls}
                             />
 
-                            <div class="space-y-3 max-h-[500px] overflow-y-auto pr-1">
+                            <div className="flex gap-1.5 overflow-x-auto pb-1 text-xs">
+                                {['Todos', 'Potencial Cliente', 'Cliente', 'Fornecedor'].map(cat => (
+                                    <button
+                                        key={cat}
+                                        type="button"
+                                        onClick={() => setFilterCategory(cat)}
+                                        className={`px-3 py-1.5 rounded-lg border font-medium transition whitespace-nowrap ${
+                                            filterCategory === cat 
+                                                ? 'bg-indigo-600 border-indigo-500 text-white' 
+                                                : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                                        }`}
+                                    >
+                                        {cat}
+                                    </button>
+                                ))}
+                            </div>
+
+                            <div className="space-y-3 max-h-[420px] overflow-y-auto pr-1">
                                 {filteredContacts.length === 0 ? (
-                                    <div class="text-center py-16 text-slate-500 text-sm">
-                                        <i class="fa-regular fa-address-book text-4xl text-slate-700 mb-3 block"></i>
+                                    <div className="text-center py-12 text-slate-500 text-sm">
                                         Nenhum contacto encontrado.
                                     </div>
                                 ) : (
                                     filteredContacts.map(c => (
-                                        <div key={c.id} class="bg-slate-950/60 ring-1 ring-white/5 p-4 rounded-xl space-y-2 relative group hover:ring-indigo-500/40 hover:-translate-y-0.5 transition fade-in">
-                                            <div class="flex justify-between items-start pr-12">
-                                                <div class="flex items-center gap-3 min-w-0">
-                                                    <div class="w-10 h-10 shrink-0 rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center text-sm font-bold text-white shadow-lg shadow-indigo-900/40">{initials(c.nome)}</div>
-                                                    <div class="min-w-0">
-                                                        <h3 class="font-bold text-slate-100 text-base truncate">{c.nome}</h3>
-                                                        {c.empresa && <p class="text-xs text-indigo-400 font-medium truncate">{c.empresa}</p>}
+                                        <div key={c.id} className="bg-slate-950 border border-slate-800 p-4 rounded-xl space-y-2 relative group hover:border-slate-700 transition">
+                                            <div className="flex justify-between items-start pr-16">
+                                                <div>
+                                                    <div className="flex items-center gap-2">
+                                                        <h3 className="font-semibold text-slate-100">{c.nome}</h3>
+                                                        {getTypeBadge(c.tipo_contacto || 'Potencial Cliente')}
                                                     </div>
+                                                    {c.empresa && <p className="text-xs text-indigo-400 font-medium mt-0.5">{c.empresa}</p>}
                                                 </div>
 
-                                                {/* Ações de Edição/Eliminação */}
-                                                <div class="absolute top-3 right-3 flex items-center gap-2">
-                                                    <button
-                                                        onClick={() => exportToVCard(c)}
-                                                        class="text-slate-500 hover:text-emerald-400 transition text-xs p-1"
-                                                        title="Descarregar vCard (.vcf)"
-                                                    >
-                                                        <i class="fa-solid fa-address-card"></i>
-                                                    </button>
+                                                <div className="absolute top-3 right-3 flex items-center gap-1.5">
                                                     <button
                                                         onClick={() => handleEdit(c)}
-                                                        class="text-slate-500 hover:text-indigo-400 transition text-xs p-1"
+                                                        className="text-slate-500 hover:text-indigo-400 text-xs p-1"
                                                         title="Editar"
                                                     >
-                                                        <i class="fa-solid fa-pen"></i>
+                                                        <i className="fa-solid fa-pen"></i>
                                                     </button>
                                                     <button
                                                         onClick={() => handleDelete(c.id)}
-                                                        class="text-slate-500 hover:text-red-400 transition text-xs p-1"
+                                                        className="text-slate-500 hover:text-red-400 text-xs p-1"
                                                         title="Eliminar"
                                                     >
-                                                        <i class="fa-solid fa-trash"></i>
+                                                        <i className="fa-solid fa-trash"></i>
                                                     </button>
                                                 </div>
                                             </div>
 
-                                            {/* Ligações Rápidas (Chamada / Email) */}
-                                            <div class="text-xs text-slate-400 space-y-1 pt-2 border-t border-slate-800/80 grid grid-cols-1 sm:grid-cols-2 gap-1">
-                                                {c.telefone && (
-                                                    <a href={`tel:${c.telefone}`} class="hover:text-slate-200 transition flex items-center gap-1.5 truncate">
-                                                        <i class="fa-solid fa-phone text-slate-500 w-3.5"></i> {c.telefone}
-                                                    </a>
-                                                )}
-                                                {c.email && (
-                                                    <a href={`mailto:${c.email}`} class="hover:text-slate-200 transition flex items-center gap-1.5 truncate">
-                                                        <i class="fa-solid fa-envelope text-slate-500 w-3.5"></i> {c.email}
-                                                    </a>
-                                                )}
+                                            <div className="text-xs text-slate-400 space-y-1 pt-1 border-t border-slate-800/80">
+                                                {c.telefone && <p><i className="fa-solid fa-phone text-slate-500 w-4"></i> {c.telefone}</p>}
+                                                {c.email && <p><i className="fa-solid fa-envelope text-slate-500 w-4"></i> {c.email}</p>}
+                                                {c.notas && <p className="text-[11px] text-slate-500 italic pt-0.5">"{c.notas}"</p>}
                                             </div>
-
-                                            {c.notas && (
-                                                <p class="text-[11px] text-slate-500 pt-1 italic border-t border-slate-900">
-                                                    "{c.notas}"
-                                                </p>
-                                            )}
                                         </div>
                                     ))
                                 )}
@@ -1023,3 +933,4 @@
     </script>
 </body>
 </html>
+
