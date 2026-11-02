@@ -15,320 +15,100 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
-        body{font-family:'Inter',system-ui,sans-serif;background:radial-gradient(900px 500px at 8% -10%,rgba(99,102,241,.18),transparent 60%),radial-gradient(700px 400px at 100% 0%,rgba(16,185,129,.09),transparent 60%),#020617;background-attachment:fixed}
-        .fade-in{animation:fadeIn .25s ease-out}
-        @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-        .scanline{animation:scan 1.6s ease-in-out infinite}
-        @keyframes scan{0%{top:6%}50%{top:92%}100%{top:6%}}
-        .autofill{box-shadow:0 0 0 1px rgba(52,211,153,.6)}
+        body {
+            font-family: 'Inter', system-ui, sans-serif;
+            background: radial-gradient(900px 500px at 8% -10%, rgba(99,102,241,.18), transparent 60%),
+                        radial-gradient(700px 400px at 100% 0%, rgba(16,185,129,.09), transparent 60%),
+                        #020617;
+            background-attachment: fixed;
+        }
+        .fade-in { animation: fadeIn .25s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+        .scanline { animation: scan 1.6s ease-in-out infinite; }
+        @keyframes scan { 0% { top: 6%; } 50% { top: 92%; } 100% { top: 6%; } }
+        @media (prefers-reduced-motion: reduce) {
+            .fade-in, .scanline { animation: none !important; transition: none !important; }
+        }
     </style>
 </head>
 <body class="text-slate-100 min-h-screen selection:bg-indigo-500 selection:text-white antialiased">
+    <a href="#main-content" class="sr-only focus:not-sr-only focus:absolute focus:top-4 focus:left-4 focus:z-50 focus:bg-indigo-600 focus:text-white focus:px-4 focus:py-2 focus:rounded-lg focus:outline-none focus:ring-2 focus:ring-white">
+        Saltar para o conteúdo principal
+    </a>
+
     <div id="root"></div>
 
     <script type="text/babel">
         const { useState, useRef, useEffect } = React;
 
-        // CREDENCIAIS SUPABASE
         const SUPABASE_URL = 'https://ntgjarmnqoyvxghgqrhj.supabase.co'; 
+        // ⚠️ COLA AQUI A CHAVE COMPLETA COPIADA DO PAINEL DO SUPABASE:
         const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im50Z2phcm1ucW95dnhnaGdxcmhqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMwMjEyNDAsImV4cCI6MjEwODU5NzI0MH0.tIZFe0t-J8JgXMb2pAhlTkOqCVvBGH2D_B5b444ioUM';
-        const supabaseClient = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
-        // ===== Pré-processamento e extração de dados de cartões de visita =====
+        const supabaseClient = window.supabase && SUPABASE_URL.startsWith('http') ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
-        function enhanceForOCR(src) {
-            const targetW = 2200;
-            const scale = Math.min(3, Math.max(0.4, targetW / src.width));
+        function enhanceForOCR(srcCanvas) {
             const out = document.createElement('canvas');
-            out.width = Math.round(src.width * scale);
-            out.height = Math.round(src.height * scale);
-            const octx = out.getContext('2d', { willReadFrequently: true });
-            octx.imageSmoothingEnabled = true;
-            octx.imageSmoothingQuality = 'high';
-            octx.drawImage(src, 0, 0, out.width, out.height);
+            const targetWidth = 2200;
+            const scale = Math.min(3, Math.max(0.5, targetWidth / srcCanvas.width));
+            out.width = Math.round(srcCanvas.width * scale);
+            out.height = Math.round(srcCanvas.height * scale);
+            
+            const ctx = out.getContext('2d', { willReadFrequently: true });
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(srcCanvas, 0, 0, out.width, out.height);
 
-            const img = octx.getImageData(0, 0, out.width, out.height);
-            const d = img.data;
-            const hist = new Array(256).fill(0);
-            let sum = 0;
-            for (let i = 0; i < d.length; i += 4) {
-                const g = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
-                d[i] = g;
-                hist[g]++;
-                sum += g;
-            }
-            const total = d.length / 4;
-            const mean = sum / total;
-
-            let acc = 0, lo = 0, hi = 255;
-            for (let t = 0; t < 256; t++) { acc += hist[t]; if (acc >= total * 0.01) { lo = t; break; } }
-            acc = 0;
-            for (let t = 255; t >= 0; t--) { acc += hist[t]; if (acc >= total * 0.01) { hi = t; break; } }
-            if (hi - lo < 30) { lo = Math.max(0, lo - 15); hi = Math.min(255, hi + 15); }
-            const range = Math.max(1, hi - lo);
-            const invert = mean < 110;
+            const imgData = ctx.getImageData(0, 0, out.width, out.height);
+            const d = imgData.data;
 
             for (let i = 0; i < d.length; i += 4) {
-                let v = ((d[i] - lo) * 255) / range;
-                v = v < 0 ? 0 : v > 255 ? 255 : v;
-                if (invert) v = 255 - v;
-                d[i] = d[i + 1] = d[i + 2] = v;
-                d[i + 3] = 255;
+                const gray = Math.round(0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2]);
+                const v = gray < 120 ? Math.max(0, gray - 30) : Math.min(255, gray + 30);
+                d[i] = d[i+1] = d[i+2] = v;
             }
-            octx.putImageData(img, 0, 0);
+            
+            ctx.putImageData(imgData, 0, 0);
             return out;
         }
 
-        function adaptiveBinarize(src) {
-            const w = src.width, hgt = src.height;
-            const c = document.createElement('canvas');
-            c.width = w; c.height = hgt;
-            const x = c.getContext('2d', { willReadFrequently: true });
-            x.drawImage(src, 0, 0);
-            const im = x.getImageData(0, 0, w, hgt), d = im.data;
-            const W1 = w + 1;
-            const I = new Float64Array(W1 * (hgt + 1));
-            for (let y = 0; y < hgt; y++) {
-                let row = 0;
-                for (let xx = 0; xx < w; xx++) {
-                    row += d[(y * w + xx) * 4];
-                    I[(y + 1) * W1 + xx + 1] = I[y * W1 + xx + 1] + row;
-                }
-            }
-            const r = Math.max(8, Math.round(w / 60));
-            for (let y = 0; y < hgt; y++) {
-                const y0 = Math.max(0, y - r), y1 = Math.min(hgt, y + r + 1);
-                for (let xx = 0; xx < w; xx++) {
-                    const x0 = Math.max(0, xx - r), x1 = Math.min(w, xx + r + 1);
-                    const s = I[y1 * W1 + x1] - I[y0 * W1 + x1] - I[y1 * W1 + x0] + I[y0 * W1 + x0];
-                    const mean = s / ((x1 - x0) * (y1 - y0));
-                    const i = (y * w + xx) * 4;
-                    const v = d[i] < mean * 0.9 ? 0 : 255;
-                    d[i] = d[i + 1] = d[i + 2] = v;
-                }
-            }
-            x.putImageData(im, 0, 0);
-            return c;
-        }
-
-        const EMAIL_RE = /[a-z0-9][a-z0-9._%+\-]*@[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}/gi;
-        const PHONE_PT_RE = /(?:\(?(?:\+|00)?351\)?[\s.\-]?)?[239](?:[\s.\-]?\d){8}/g;
-        const PHONE_INTL_RE = /\+\d{1,3}(?:[\s.\-]?\d){7,12}/;
-        const URL_RE = /(www\.|https?:|\b[a-z0-9\-]+\.(?:pt|com|net|org|eu|es|fr|co|io|biz|info)\b)/i;
-        const LABEL_RE = /^\s*(tel|tlm|tlf|telem|telef|fax|e-?mail|mob|mobile|phone|site|web|www|nif)\b/i;
-        const SKIP_PHONE_RE = /\bnif\b|contribuinte|\bvat\b|iban/i;
-        const FAX_RE = /fax\s*[:.]?\s*[+()\d\s.\-]+/gi;
-        const COMPANY_RE = /\b(lda\.?|unipessoal|sgps|ltd|llc|inc|gmbh|s\.l\.?|sociedade|com[eé]rcio|servi[cç]os|consultoria|engenharia|constru[cç][oõ]es|ind[uú]stria|group|grupo|solutions|systems|technologies|associados|& filhos|e filhos)\b/i;
-        const COMPANY_CS_RE = /\bS\.?A\.?\b/;
-        const JOB_RE = /\b(diretor|director|diretora|gerente|gestor|gestora|administrador|administradora|engenheir[oa]|arquitet[oa]|comercial|consultor|consultora|t[eé]cnic[oa]|respons[aá]vel|manager|ceo|cto|cfo|coo|sales|developer|designer|advogad[oa]|m[eé]dic[oa]|analista|coordenador|coordenadora|assistente|presidente|fundador|partner|s[oó]cio|executive|specialist|especialista|supervisor|chefe|head|owner|propriet[aá]rio)\b/i;
-        const ADDR_RE = /\b(rua|avenida|av|pra[cç]a|largo|travessa|estrada|zona|lote|edif[ií]cio|urb|apartado|bairro|parque|andar|loja|fra[cç][aã]o|sala|km)\b|\b\d{4}[\-\s]\d{3}\b/i;
-        const TITLE_PREFIX_RE = /^(dr\.?|dra\.?|eng\.?|eng\.?ª|arq\.?|prof\.?|prof\.?ª|sr\.?|sra\.?|mr\.?|ms\.?|mrs\.?)\s+/i;
-        const PARTICLES = new Set(['de', 'da', 'do', 'dos', 'das', 'e', 'di', 'van', 'von', 'del', 'la', 'le']);
-        const GENERIC_PROVIDERS = new Set(['gmail', 'hotmail', 'outlook', 'live', 'sapo', 'yahoo', 'icloud', 'mail', 'msn', 'iol', 'netcabo', 'clix', 'proton', 'protonmail', 'gmx', 'aol']);
-        const GENERIC_LOCAL = new Set(['info', 'geral', 'comercial', 'contacto', 'contact', 'sales', 'admin', 'office', 'suporte', 'support', 'mail', 'vendas', 'marketing', 'rh', 'financeiro']);
-
-        function stripAccents(s) {
-            return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-        }
-
-        function findEmails(text) {
-            let t = text
+        function extractContactData(textBlob) {
+            const cleanText = textBlob
+                .replace(/\|/g, '')
                 .replace(/[©®]/g, '@')
-                .replace(/\(\s*(?:at|a)\s*\)|\[\s*at\s*\]/gi, '@')
-                .replace(/\s*@\s*/g, '@');
-            if (!t.includes('@')) return [];
-            const candidates = [t, t.replace(/\s+/g, '')];
-            for (const cand of candidates) {
-                const fixed = cand.replace(/(@[a-z0-9.\-]*),([a-z]{2,4})(?![a-z])/i, '$1.$2');
-                const m = fixed.match(EMAIL_RE);
-                if (m) return m.map(x => x.toLowerCase());
-            }
-            return [];
-        }
+                .replace(/\r/g, '');
 
-        function fixDigitLookalikes(line) {
-            return line.split(/(\s+)/).map(tok =>
-                (/\d/.test(tok) && /^[+()\d OolI|.\-]+$/.test(tok)) ? tok.replace(/[Oo]/g, '0').replace(/[lI|]/g, '1') : tok
-            ).join('');
-        }
+            const emailMatch = cleanText.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/i);
+            const email = emailMatch ? emailMatch[0].toLowerCase().trim() : '';
 
-        function findPhones(line) {
-            if (SKIP_PHONE_RE.test(line)) return [];
-            const t = fixDigitLookalikes(line.replace(FAX_RE, ' '));
-            const re = new RegExp(PHONE_PT_RE.source, 'g');
-            const out = [];
-            let m;
-            while ((m = re.exec(t)) !== null) {
-                const before = t[m.index - 1];
-                const after = t[m.index + m[0].length];
-                if ((before && /\d/.test(before)) || (after && /\d/.test(after))) continue;
-                let digits = m[0].replace(/\D/g, '').replace(/^00/, '');
-                let intl = false;
-                if (digits.length === 12 && digits.startsWith('351')) { digits = digits.slice(3); intl = true; }
-                if (digits.length !== 9) continue;
-                const fmt = `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}`;
-                out.push({ text: intl ? `+351 ${fmt}` : fmt, mobile: /^9[1236]/.test(digits) });
-            }
-            return out;
-        }
-
-        function levenshtein(a, b) {
-            const m = Array.from({ length: a.length + 1 }, (_, i) => [i]);
-            for (let j = 1; j <= b.length; j++) m[0][j] = j;
-            for (let i = 1; i <= a.length; i++)
-                for (let j = 1; j <= b.length; j++)
-                    m[i][j] = Math.min(m[i - 1][j] + 1, m[i][j - 1] + 1, m[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-            return m[a.length][b.length];
-        }
-
-        const inputCls = 'w-full bg-slate-950/70 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 transition';
-
-        function extractContactData(passes) {
-            const rawText = passes.map((p, i) => `--- passagem ${i + 1}${p.aux ? ' (email/telefone)' : ''} ---\n${(p.text || '').trim()}`).join('\n\n');
-
-            const entries = [];
-            passes.filter(p => !p.aux).forEach(data => {
-                let lines = (data.lines || []).map(l => ({
-                    text: (l.text || '').replace(/\s+/g, ' ').trim(),
-                    h: l.bbox ? (l.bbox.y1 - l.bbox.y0) : 0,
-                    conf: typeof l.confidence === 'number' ? l.confidence : 70
-                }));
-                if (!lines.length) lines = (data.text || '').split('\n').map(t => ({ text: t.trim(), h: 0, conf: 70 }));
-                lines = lines.filter(l => l.text.length > 1);
-                const hs = lines.map(l => l.h).filter(h => h > 0).sort((a, b) => a - b);
-                const median = hs.length ? hs[Math.floor(hs.length / 2)] : 0;
-                lines.forEach(l => entries.push({ ...l, rel: median && l.h ? l.h / median : 1 }));
-            });
-            const byKey = new Map();
-            entries.forEach(e => {
-                const k = stripAccents(e.text).replace(/[^a-z0-9@]/g, '');
-                if (!k) return;
-                const prev = byKey.get(k);
-                if (!prev || e.conf > prev.conf) byKey.set(k, e);
-            });
-            const lines = Array.from(byKey.values());
-            const allTexts = passes.flatMap(p => (p.text || '').split('\n')).map(t => t.trim()).filter(Boolean);
-
-            const emailCount = new Map();
-            allTexts.forEach(t => findEmails(t).forEach(e => emailCount.set(e, (emailCount.get(e) || 0) + 1)));
-            let foundEmail = Array.from(emailCount.entries()).sort((a, b) => b[1] - a[1]).map(x => x[0])[0] || '';
-
-            const siteM = allTexts.map(t => t.match(/www\.([a-z0-9\-]+)\.[a-z]{2,}/i)).find(Boolean);
-            if (foundEmail && siteM) {
-                const siteRoot = siteM[1].toLowerCase();
-                const [lp, dom] = foundEmail.split('@');
-                const parts = dom.split('.');
-                if (parts[0] !== siteRoot && !GENERIC_PROVIDERS.has(parts[0]) && levenshtein(parts[0], siteRoot) <= 2) {
-                    foundEmail = `${lp}@${[siteRoot, ...parts.slice(1)].join('.')}`;
+            const phoneMatch = cleanText.match(/(?:\+351|00351)?[\s.\-]?(?:9[1236]\d|2\d{2}|30\d)[\s.\-]?\d{3}[\s.\-]?\d{3}/g);
+            let telefone = '';
+            if (phoneMatch && phoneMatch.length > 0) {
+                let digits = phoneMatch[0].replace(/\D/g, '');
+                if (digits.startsWith('351') && digits.length === 12) digits = digits.slice(3);
+                if (digits.length === 9) {
+                    telefone = `${digits.slice(0,3)} ${digits.slice(3,6)} ${digits.slice(6)}`;
+                } else {
+                    telefone = phoneMatch[0].trim();
                 }
             }
 
-            const phoneMap = new Map();
-            allTexts.forEach(t => findPhones(t).forEach(p => {
-                const e = phoneMap.get(p.text) || { ...p, count: 0 };
-                e.count++;
-                phoneMap.set(p.text, e);
-            }));
-            let foundPhone = Array.from(phoneMap.values())
-                .sort((a, b) => (b.count - a.count) || ((b.mobile ? 1 : 0) - (a.mobile ? 1 : 0)))
-                .map(p => p.text)[0] || '';
-            if (!foundPhone) {
-                for (const t of allTexts) {
-                    if (SKIP_PHONE_RE.test(t)) continue;
-                    const m = t.replace(FAX_RE, ' ').match(PHONE_INTL_RE);
-                    if (m) { foundPhone = m[0].trim(); break; }
-                }
-            }
+            const lines = cleanText.split('\n')
+                .map(l => l.trim())
+                .filter(l => {
+                    if (l.length < 3) return false;
+                    if (l.includes('@') || l.match(/\d{6,}/) || l.toLowerCase().includes('www')) return false;
+                    return true;
+                });
 
-            const local = foundEmail ? stripAccents(foundEmail.split('@')[0]) : '';
-            const domainRoot = foundEmail ? stripAccents(foundEmail.split('@')[1]).split('.')[0] : '';
-            const domainUseful = domainRoot.length >= 3 && !GENERIC_PROVIDERS.has(domainRoot);
+            let nome = lines[0] || '';
+            let empresa = lines[1] || '';
 
-            const isContactLine = (txt) =>
-                /@/.test(txt) || findEmails(txt).length > 0 || findPhones(txt).length > 0 ||
-                URL_RE.test(txt) || LABEL_RE.test(txt) || txt.replace(/\D/g, '').length >= 7;
-
-            const cleanName = (s) => s
-                .replace(/^[^A-Za-zÀ-ÖØ-öø-ÿ]+/, '')
-                .replace(/[^A-Za-zÀ-ÖØ-öø-ÿ.]+$/, '')
-                .replace(/\s+/g, ' ');
-
-            const nameShape = (s) => {
-                const t = cleanName(s.replace(TITLE_PREFIX_RE, ''));
-                if (/\d|@/.test(t)) return null;
-                if (!/^[A-Za-zÀ-ÖØ-öø-ÿ'’.\- ]+$/.test(t)) return null;
-                const words = t.split(' ').filter(Boolean);
-                const main = words.filter(w => !PARTICLES.has(w.toLowerCase()));
-                if (words.length < 2 || words.length > 5 || main.length < 2) return null;
-                if (main.some(w => w.replace(/[.\-']/g, '').length < 2 && !/^[A-Z]\.$/.test(w))) return null;
-                return { text: t, words, main };
-            };
-
-            let name = '';
-            let nameLineIdx = -1;
-            let bestNameScore = -Infinity;
-            lines.forEach((l, idx) => {
-                if (isContactLine(l.text)) return;
-                const shape = nameShape(l.text);
-                if (!shape) return;
-                let score = shape.words.length <= 4 ? 3 : 1;
-                const allCaps = shape.main.every(w => w === w.toUpperCase());
-                const titleCase = shape.main.every(w => /^[A-ZÀ-ÖØ-Þ]/.test(w));
-                if (titleCase && !allCaps) score += 3; else if (allCaps) score += 1;
-                if (TITLE_PREFIX_RE.test(l.text)) score += 2;
-                if (COMPANY_RE.test(l.text) || COMPANY_CS_RE.test(l.text)) score -= 6;
-                if (JOB_RE.test(l.text)) score -= 6;
-                if (ADDR_RE.test(l.text)) score -= 6;
-                const matches = local ? shape.main.filter(w => {
-                    const a = stripAccents(w).replace(/[^a-z]/g, '');
-                    return a.length >= 3 && local.includes(a);
-                }).length : 0;
-                score += matches * 3;
-                if (l.rel > 1.15) score += 1;
-                if (l.conf < 50) score -= 2; else if (l.conf > 80) score += 1;
-                score -= idx * 0.1;
-                if (score > bestNameScore) { bestNameScore = score; name = shape.text; nameLineIdx = idx; }
-            });
-            if (bestNameScore < 3) { name = ''; nameLineIdx = -1; }
-
-            if (!name && local && /^[a-z]{2,}[._\-][a-z]{2,}$/.test(local)) {
-                const toks = local.split(/[._\-]/);
-                if (!toks.some(t => GENERIC_LOCAL.has(t))) {
-                    name = toks.map(t => t.charAt(0).toUpperCase() + t.slice(1)).join(' ');
-                }
-            }
-
-            let cargo = '';
-            for (const l of lines) {
-                if (isContactLine(l.text) || ADDR_RE.test(l.text)) continue;
-                if (JOB_RE.test(l.text) && !COMPANY_RE.test(l.text) && !/\d/.test(l.text)) {
-                    cargo = l.text.replace(/^[^A-Za-zÀ-ÖØ-öø-ÿ]+/, '').replace(/[^A-Za-zÀ-ÖØ-öø-ÿ.)]+$/, '');
-                    break;
-                }
-            }
-
-            let empresa = '';
-            let bestCompScore = -Infinity;
-            lines.forEach((l, idx) => {
-                if (idx === nameLineIdx) return;
-                const txt = l.text;
-                if (isContactLine(txt) || ADDR_RE.test(txt) || JOB_RE.test(txt)) return;
-                const letters = (txt.match(/[A-Za-zÀ-ÖØ-öø-ÿ]/g) || []).length;
-                if (letters < 3 || letters / txt.length < 0.6 || txt.length > 45) return;
-                let score = 0;
-                if (COMPANY_RE.test(txt) || COMPANY_CS_RE.test(txt)) score += 5;
-                if (domainUseful && stripAccents(txt).replace(/[^a-z0-9]/g, '').includes(domainRoot)) score += 4;
-                if (l.rel > 1.3) score += 2;
-                if (l.conf > 70) score += 1; else if (l.conf < 50) score -= 2;
-                if (nameShape(txt) && !(COMPANY_RE.test(txt) || COMPANY_CS_RE.test(txt))) score -= 0.3;
-                score -= idx * 0.05;
-                if (score > bestCompScore) { bestCompScore = score; empresa = txt.replace(/^[^A-Za-zÀ-ÖØ-öø-ÿ0-9]+/, '').replace(/[|\-–—_]+$/, '').trim(); }
-            });
-            if (bestCompScore < 0.5) empresa = '';
-            if (!empresa && domainUseful) empresa = domainRoot.charAt(0).toUpperCase() + domainRoot.slice(1);
-
-            return { nome: name, empresa, telefone: foundPhone, email: foundEmail, cargo, rawText };
+            return { nome, empresa, telefone, email };
         }
+
+        const inputCls = "w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-sm text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:ring-offset-2 focus:ring-offset-slate-950 transition";
+        const btnBaseCls = "focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:ring-offset-2 focus:ring-offset-slate-950 transition font-medium text-xs rounded-xl";
 
         function App() {
             const [contacts, setContacts] = useState([]);
@@ -338,38 +118,39 @@
 
             const [isCameraActive, setIsCameraActive] = useState(false);
             const [stream, setStream] = useState(null);
-            
-            const [videoDevices, setVideoDevices] = useState([]);
-            const [selectedDeviceId, setSelectedDeviceId] = useState('');
             const [rotation, setRotation] = useState(0);
             const [isMirrored, setIsMirrored] = useState(false);
             
-            const [ocrReady, setOcrReady] = useState(false);
             const [isProcessing, setIsProcessing] = useState(false);
             const [statusMessage, setStatusMessage] = useState('Pronto a digitalizar.');
             const [toast, setToast] = useState(null);
 
             const [formData, setFormData] = useState({
-                nome: '',
-                empresa: '',
-                telefone: '',
-                email: '',
-                tipo_contacto: 'Potencial Cliente',
-                notas: ''
+                nome: '', empresa: '', telefone: '', email: '', tipo_contacto: 'Potencial Cliente', notas: ''
             });
 
             const videoRef = useRef(null);
             const canvasRef = useRef(null);
             const fileInputRef = useRef(null);
             const workerRef = useRef(null);
+            const nameInputRef = useRef(null);
+
+            const showToast = (msg, type = 'info') => {
+                setToast({ msg, type });
+                setTimeout(() => setToast(null), 5000);
+            };
 
             const fetchContacts = async () => {
                 if (!supabaseClient) return;
                 try {
                     const { data, error } = await supabaseClient.from('contactos').select('*').order('created_at', { ascending: false });
-                    if (!error && data) setContacts(data);
+                    if (error) {
+                        console.error("Erro na leitura:", error);
+                    } else if (data) {
+                        setContacts(data);
+                    }
                 } catch (err) {
-                    console.error("Erro ao carregar do Supabase:", err);
+                    console.error("Erro inesperado:", err);
                 }
             };
 
@@ -377,44 +158,19 @@
                 fetchContacts();
             }, []);
 
-            const showToast = (msg, type = 'info') => {
-                setToast({ msg, type });
-                setTimeout(() => setToast(null), 3000);
-            };
-
             useEffect(() => {
                 async function initOCR() {
                     try {
                         const worker = await Tesseract.createWorker('por+eng');
-                        await worker.setParameters({ preserve_interword_spaces: '1', user_defined_dpi: '300' });
+                        await worker.setParameters({ preserve_interword_spaces: '1' });
                         workerRef.current = worker;
-                        setOcrReady(true);
                     } catch (err) {
-                        console.error("Erro OCR:", err);
+                        console.error("Erro ao inicializar OCR:", err);
                     }
                 }
                 initOCR();
-
-                return () => {
-                    if (workerRef.current) workerRef.current.terminate();
-                };
+                return () => { if (workerRef.current) workerRef.current.terminate(); };
             }, []);
-
-            const loadVideoDevices = async () => {
-                try {
-                    const devices = await navigator.mediaDevices.enumerateDevices();
-                    const cameras = devices.filter(d => d.kind === 'videoinput');
-                    setVideoDevices(cameras);
-                    if (cameras.length > 0 && !selectedDeviceId) {
-                        const backCamera = cameras.find(c => c.label.toLowerCase().includes('back') || c.label.toLowerCase().includes('traseira'));
-                        setSelectedDeviceId(backCamera ? backCamera.deviceId : cameras[0].deviceId);
-                    }
-                } catch (err) {
-                    console.error("Erro câmaras:", err);
-                }
-            };
-
-            useEffect(() => { loadVideoDevices(); }, []);
 
             useEffect(() => {
                 if (isCameraActive && videoRef.current && stream) {
@@ -423,102 +179,77 @@
                 }
             }, [isCameraActive, stream]);
 
-            const startCamera = async (deviceId = selectedDeviceId) => {
+            const startCamera = async () => {
                 stopCamera();
                 try {
-                    const constraints = {
-                        video: deviceId 
-                            ? { deviceId: { exact: deviceId }, width: { ideal: 3840 }, height: { ideal: 2160 } }
-                            : { facingMode: 'environment', width: { ideal: 3840 }, height: { ideal: 2160 } }
-                    };
-
-                    const newStream = await navigator.mediaDevices.getUserMedia(constraints);
+                    const newStream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
+                    });
                     setStream(newStream);
                     setIsCameraActive(true);
-                    setStatusMessage('Enquadra o cartão e clica no botão.');
-                    loadVideoDevices();
+                    setStatusMessage('Câmara ativa. Enquadre o cartão de visita.');
                 } catch (err) {
-                    console.error("Erro de câmara:", err);
-                    showToast("Erro ao abrir a câmara", "error");
+                    showToast("Erro ao abrir a câmara. Verifique as permissões.", "error");
                     setIsCameraActive(false);
                 }
             };
 
             const stopCamera = () => {
-                if (stream) {
-                    stream.getTracks().forEach(track => track.stop());
-                    setStream(null);
-                }
+                if (stream) stream.getTracks().forEach(track => track.stop());
+                setStream(null);
                 setIsCameraActive(false);
                 setIsProcessing(false);
+                setStatusMessage('Câmara fechada.');
             };
 
-            const runOCR = async (gray) => {
+            const runOCR = async (canvasElement) => {
                 const worker = workerRef.current;
-                const bin = adaptiveBinarize(gray);
-                const WL = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@._-+() ';
-                const jobs = [
-                    { img: gray, psm: '11' },
-                    { img: gray, psm: '6' },
-                    { img: bin, psm: '11' },
-                    { img: gray, psm: '11', wl: WL, aux: true }
-                ];
-                const passes = [];
-                for (let i = 0; i < jobs.length; i++) {
-                    setStatusMessage(`A ler o cartão localmente... passagem ${i + 1}/${jobs.length}`);
-                    await worker.setParameters({ tessedit_pageseg_mode: jobs[i].psm, tessedit_char_whitelist: jobs[i].wl || '' });
-                    const { data } = await worker.recognize(jobs[i].img);
-                    data.aux = !!jobs[i].aux;
-                    passes.push(data);
-                }
-                await worker.setParameters({ tessedit_char_whitelist: '' });
-                return passes;
+                const processed = enhanceForOCR(canvasElement);
+                
+                await worker.setParameters({ tessedit_pageseg_mode: '3' });
+                const res1 = await worker.recognize(processed);
+                
+                await worker.setParameters({ tessedit_pageseg_mode: '6' });
+                const res2 = await worker.recognize(processed);
+
+                return `${res1.data.text}\n${res2.data.text}`;
             };
 
             const captureAndProcess = async () => {
                 if (!videoRef.current || !canvasRef.current || !workerRef.current) return;
-                const video = videoRef.current;
-                if (video.readyState !== video.HAVE_ENOUGH_DATA) return;
-
                 setIsProcessing(true);
-                setStatusMessage('A analisar cartão localmente...');
+                setStatusMessage('A analisar a imagem do cartão...');
 
                 try {
+                    const video = videoRef.current;
                     const canvas = canvasRef.current;
                     const ctx = canvas.getContext('2d');
-
-                    const vW = video.videoWidth || 1280;
-                    const vH = video.videoHeight || 720;
-
-                    const cropW = vW * 0.85;
-                    const cropH = vH * 0.65;
-                    const cropX = (vW - cropW) / 2;
-                    const cropY = (vH - cropH) / 2;
-
-                    canvas.width = cropW;
-                    canvas.height = cropH;
+                    canvas.width = video.videoWidth || 1280;
+                    canvas.height = video.videoHeight || 720;
 
                     ctx.save();
-                    ctx.translate(cropW / 2, cropH / 2);
+                    ctx.translate(canvas.width / 2, canvas.height / 2);
                     if (rotation !== 0) ctx.rotate((rotation * Math.PI) / 180);
                     if (isMirrored) ctx.scale(-1, 1);
-
-                    ctx.drawImage(video, cropX, cropY, cropW, cropH, -cropW / 2, -cropH / 2, cropW, cropH);
+                    ctx.drawImage(video, -canvas.width / 2, -canvas.height / 2, canvas.width, canvas.height);
                     ctx.restore();
 
-                    const passes = await runOCR(enhanceForOCR(canvas));
-                    const result = parseTextAndFill(passes);
-                    if (result === 'full') {
-                        showToast('Cartão lido com sucesso!', 'success');
-                        setTimeout(() => stopCamera(), 400);
-                    } else if (result === 'partial') {
-                        showToast('Leitura parcial: confirma os campos.', 'warning');
-                    } else {
-                        showToast('Não foi possível reconhecer dados claros.', 'warning');
-                    }
+                    const textBlob = await runOCR(canvas);
+                    const r = extractContactData(textBlob);
+
+                    setFormData(prev => ({
+                        ...prev,
+                        nome: r.nome || prev.nome,
+                        empresa: r.empresa || prev.empresa,
+                        telefone: r.telefone || prev.telefone,
+                        email: r.email || prev.email
+                    }));
+
+                    showToast('Dados extraídos do cartão com sucesso!', 'success');
+                    stopCamera();
+                    if (nameInputRef.current) nameInputRef.current.focus();
                 } catch (err) {
-                    console.error("Erro na leitura:", err);
-                    showToast('Erro ao processar imagem.', 'error');
+                    showToast('Não foi possível extrair dados legíveis do cartão.', 'warning');
                 } finally {
                     setIsProcessing(false);
                 }
@@ -527,54 +258,50 @@
             const handleFileUpload = async (e) => {
                 const file = e.target.files[0];
                 if (!file || !workerRef.current) return;
-
                 setIsProcessing(true);
-                setStatusMessage('A ler foto enviada...');
+                setStatusMessage('A analisar a foto carregada...');
 
                 try {
                     const img = new Image();
                     img.src = URL.createObjectURL(file);
                     await img.decode();
-
                     const canvas = canvasRef.current;
                     const ctx = canvas.getContext('2d');
                     canvas.width = img.width;
                     canvas.height = img.height;
-
                     ctx.drawImage(img, 0, 0);
-                    const passes = await runOCR(enhanceForOCR(canvas));
 
-                    if (parseTextAndFill(passes) === 'full') {
-                        showToast('Dados extraídos da foto!', 'success');
-                    } else {
-                        showToast('Verifique os campos extraídos.', 'warning');
-                    }
+                    const textBlob = await runOCR(canvas);
+                    const r = extractContactData(textBlob);
+
+                    setFormData(prev => ({
+                        ...prev,
+                        nome: r.nome || prev.nome,
+                        empresa: r.empresa || prev.empresa,
+                        telefone: r.telefone || prev.telefone,
+                        email: r.email || prev.email
+                    }));
+
+                    showToast('Dados da imagem extraídos com sucesso!', 'success');
+                    if (nameInputRef.current) nameInputRef.current.focus();
                 } catch (err) {
-                    showToast('Erro ao ler ficheiro.', 'error');
+                    showToast('Erro ao ler a imagem carregada.', 'error');
                 } finally {
                     setIsProcessing(false);
                 }
             };
 
-            const parseTextAndFill = (passes) => {
-                const r = extractContactData(passes);
-                if (!r.nome && !r.email && !r.telefone && !r.empresa) return false;
-
-                setFormData(prev => ({
-                    ...prev,
-                    nome: r.nome || prev.nome || '',
-                    empresa: r.empresa || prev.empresa || '',
-                    telefone: r.telefone || prev.telefone || '',
-                    email: r.email || prev.email || '',
-                    notas: prev.notas || (r.cargo ? `Cargo: ${r.cargo}` : '')
-                }));
-
-                return (r.nome && (r.email || r.telefone)) ? 'full' : 'partial';
-            };
-
             const handleSubmit = async (e) => {
                 e.preventDefault();
-                if (!formData.nome) return showToast('Introduza o nome do contacto.', 'warning');
+                if (!formData.nome.trim()) {
+                    showToast('O nome do contacto é obrigatório.', 'warning');
+                    return;
+                }
+
+                if (!supabaseClient) {
+                    showToast("Por favor insira uma chave de API válida no código.", "error");
+                    return;
+                }
 
                 try {
                     if (editingId) {
@@ -587,47 +314,40 @@
                         if (error) throw error;
                         showToast('Contacto guardado com sucesso!', 'success');
                     }
-
                     setFormData({ nome: '', empresa: '', telefone: '', email: '', tipo_contacto: 'Potencial Cliente', notas: '' });
                     fetchContacts();
                 } catch (err) {
-                    alert("Erro ao guardar no Supabase: " + err.message);
+                    showToast(`Erro na DB: ${err.message || 'Verifique a chave API'}`, "error");
                 }
             };
 
             const handleEdit = (c) => {
                 setEditingId(c.id);
                 setFormData({
-                    nome: c.nome || '',
-                    empresa: c.empresa || '',
-                    telefone: c.telefone || '',
-                    email: c.email || '',
-                    tipo_contacto: c.tipo_contacto || 'Potencial Cliente',
-                    notas: c.notas || ''
+                    nome: c.nome || '', empresa: c.empresa || '', telefone: c.telefone || '', email: c.email || '', tipo_contacto: c.tipo_contacto || 'Potencial Cliente', notas: c.notas || ''
                 });
+                if (nameInputRef.current) nameInputRef.current.focus();
                 window.scrollTo({ top: 0, behavior: 'smooth' });
             };
 
-            const handleDelete = async (id) => {
-                if (!confirm('Tem a certeza que deseja eliminar este contacto?')) return;
+            const handleDelete = async (id, nome) => {
+                if (!confirm(`Tem a certeza que deseja eliminar o contacto "${nome}"?`)) return;
                 try {
                     const { error } = await supabaseClient.from('contactos').delete().eq('id', id);
                     if (error) throw error;
-                    showToast('Contacto eliminado.', 'info');
+                    showToast('Contacto eliminado com sucesso.', 'info');
                     fetchContacts();
                 } catch (err) {
-                    alert("Erro ao eliminar: " + err.message);
+                    showToast(`Erro ao eliminar: ${err.message}`, "error");
                 }
             };
 
             const exportToCSV = () => {
-                if (contacts.length === 0) return showToast("Sem contactos para exportar.", "warning");
-                
+                if (contacts.length === 0) return showToast("Não existem contactos para exportar.", "warning");
                 const headers = "Nome,Empresa,Telefone,Email,Tipo de Contacto,Notas\n";
                 const rows = contacts.map(c => `"${c.nome || ''}","${c.empresa || ''}","${c.telefone || ''}","${c.email || ''}","${c.tipo_contacto || 'Potencial Cliente'}","${c.notas || ''}"`).join("\n");
                 const blob = new Blob([headers + rows], { type: 'text/csv;charset=utf-8;' });
                 const url = URL.createObjectURL(blob);
-                
                 const a = document.createElement('a');
                 a.href = url;
                 a.download = `contactos_${new Date().toISOString().slice(0,10)}.csv`;
@@ -638,159 +358,216 @@
                 const matchesSearch = c.nome?.toLowerCase().includes(search.toLowerCase()) ||
                     c.empresa?.toLowerCase().includes(search.toLowerCase()) ||
                     c.email?.toLowerCase().includes(search.toLowerCase());
-
                 const matchesCategory = filterCategory === 'Todos' || (c.tipo_contacto || 'Potencial Cliente') === filterCategory;
-
                 return matchesSearch && matchesCategory;
             });
 
             const getTypeBadge = (tipo) => {
                 switch(tipo) {
                     case 'Cliente':
-                        return <span className="px-2 py-0.5 text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-md">Cliente</span>;
+                        return <span className="px-2.5 py-1 text-xs font-semibold bg-emerald-950 text-emerald-300 border border-emerald-700 rounded-md">Cliente</span>;
                     case 'Fornecedor':
-                        return <span className="px-2 py-0.5 text-[10px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-md">Fornecedor</span>;
+                        return <span className="px-2.5 py-1 text-xs font-semibold bg-amber-950 text-amber-300 border border-amber-700 rounded-md">Fornecedor</span>;
                     default:
-                        return <span className="px-2 py-0.5 text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded-md">Potencial Cliente</span>;
+                        return <span className="px-2.5 py-1 text-xs font-semibold bg-indigo-950 text-indigo-300 border border-indigo-700 rounded-md">Potencial Cliente</span>;
                 }
             };
 
             return (
                 <div className="max-w-5xl mx-auto p-4 md:p-6 space-y-6">
-                    <canvas ref={canvasRef} className="hidden"></canvas>
-                    <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" className="hidden" />
+                    <canvas ref={canvasRef} className="hidden" aria-hidden="true"></canvas>
+
+                    <input 
+                        type="file" 
+                        ref={fileInputRef} 
+                        onChange={handleFileUpload} 
+                        accept="image/*" 
+                        className="hidden" 
+                        id="file-upload-input"
+                        aria-label="Carregar foto de cartão de visita"
+                    />
+
+                    <div role="status" aria-live="polite" className="sr-only">
+                        {statusMessage}
+                    </div>
 
                     {toast && (
-                        <div className={`fixed bottom-5 right-5 px-4 py-3 rounded-xl border shadow-2xl text-xs font-semibold z-50 fade-in ${
-                            toast.type === 'success' ? 'bg-emerald-950 border-emerald-800 text-emerald-300' :
-                            toast.type === 'warning' ? 'bg-amber-950 border-amber-800 text-amber-300' :
-                            'bg-slate-900 border-slate-700 text-slate-200'
-                        }`}>
-                            {toast.msg}
+                        <div 
+                            role="alert" 
+                            aria-live="assertive"
+                            className={`fixed bottom-5 right-5 px-4 py-3 rounded-xl border shadow-2xl text-xs font-semibold z-50 fade-in flex items-center gap-2 ${
+                                toast.type === 'success' ? 'bg-emerald-950 border-emerald-600 text-emerald-200' :
+                                toast.type === 'warning' ? 'bg-amber-950 border-amber-600 text-amber-200' :
+                                toast.type === 'error' ? 'bg-red-950 border-red-600 text-red-200' :
+                                'bg-slate-900 border-slate-700 text-slate-100'
+                            }`}
+                        >
+                            <i className={`fa-solid ${
+                                toast.type === 'success' ? 'fa-circle-check text-emerald-400' :
+                                toast.type === 'warning' ? 'fa-triangle-exclamation text-amber-400' :
+                                toast.type === 'error' ? 'fa-circle-xmark text-red-400' :
+                                'fa-circle-info text-indigo-400'
+                            }`} aria-hidden="true"></i>
+                            <span>{toast.msg}</span>
                         </div>
                     )}
 
-                    <header className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 backdrop-blur-md shadow-2xl flex justify-between items-center">
+                    <header className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-2xl flex flex-wrap justify-between items-center gap-4">
                         <div>
-                            <h1 className="text-xl font-extrabold text-white flex items-center gap-2">
-                                <i className="fa-solid fa-address-book text-indigo-400"></i> Gestão de Contactos
+                            <h1 className="text-xl md:text-2xl font-extrabold text-white flex items-center gap-2.5">
+                                <i className="fa-solid fa-address-book text-indigo-400" aria-hidden="true"></i> 
+                                <span>Gestão Inteligente de Contactos</span>
                             </h1>
-                            <p className="text-xs text-slate-400 mt-1">Reconhecimento OCR Local (Tesseract) & Persistência Cloud</p>
+                            <p className="text-xs text-slate-300 mt-1">Extração Local OCR & Persistência Cloud</p>
                         </div>
-                        <span className="text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 px-3 py-1 rounded-full font-mono">PED-2026-001</span>
+                        <span className="text-xs bg-indigo-950 text-indigo-300 border border-indigo-700 px-3 py-1.5 rounded-md font-mono font-semibold">
+                            PED-2026-001
+                        </span>
                     </header>
 
-                    <div className="grid md:grid-cols-2 gap-6">
-                        <div className="bg-slate-900/60 border border-slate-800 p-5 rounded-2xl shadow-xl space-y-4">
-                            <div className="flex justify-between items-center">
-                                <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2">
-                                    <i className="fa-solid fa-user-plus text-indigo-400"></i> {editingId ? 'Editar Contacto' : 'Novo Contacto'}
+                    <main id="main-content" className="grid md:grid-cols-2 gap-6" tabIndex="-1">
+                        <section className="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-xl space-y-5" aria-labelledby="form-heading">
+                            <div className="flex justify-between items-center border-b border-slate-800 pb-3">
+                                <h2 id="form-heading" className="text-base font-bold text-slate-100 flex items-center gap-2">
+                                    <i className="fa-solid fa-user-plus text-indigo-400" aria-hidden="true"></i> 
+                                    <span>{editingId ? 'Editar Contacto' : 'Novo Contacto'}</span>
                                 </h2>
                                 {editingId && (
                                     <button 
                                         type="button" 
                                         onClick={() => { setEditingId(null); setFormData({ nome: '', empresa: '', telefone: '', email: '', tipo_contacto: 'Potencial Cliente', notas: '' }); }}
-                                        className="text-xs text-slate-400 hover:text-white underline"
+                                        className={`${btnBaseCls} px-3 py-1 bg-slate-800 text-slate-200 hover:bg-slate-700 underline`}
                                     >
-                                        Cancelar
+                                        Cancelar Edição
                                     </button>
                                 )}
                             </div>
 
-                            {!isCameraActive ? (
-                                <div className="grid grid-cols-2 gap-2">
-                                    <button
-                                        type="button"
-                                        onClick={() => startCamera()}
-                                        className="py-3 px-3 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-xl flex items-center justify-center gap-2 text-xs transition shadow-lg active:scale-95"
-                                    >
-                                        <i className="fa-solid fa-camera"></i> Abrir Câmara
-                                    </button>
-                                    <button
-                                        type="button"
-                                        onClick={() => fileInputRef.current?.click()}
-                                        className="py-3 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-xl flex items-center justify-center gap-2 text-xs border border-slate-700 transition active:scale-95"
-                                    >
-                                        <i className="fa-solid fa-upload"></i> Carregar Foto
-                                    </button>
-                                </div>
-                            ) : (
-                                <div className="space-y-3 bg-slate-950 p-3 rounded-xl border border-slate-800 relative">
-                                    <div className="relative rounded-lg overflow-hidden bg-black aspect-video flex items-center justify-center">
-                                        <video 
-                                            ref={videoRef} 
-                                            autoPlay 
-                                            playsInline 
-                                            muted
-                                            style={{ transform: `rotate(${rotation}deg) scaleX(${isMirrored ? -1 : 1})` }}
-                                            className="w-full h-full object-cover"
-                                        ></video>
-                                        
-                                        {isProcessing && <div className="absolute inset-x-0 h-0.5 bg-indigo-500 scanline shadow-[0_0_8px_#6366f1]"></div>}
+                            <div className="space-y-3">
+                                <label className="text-xs font-semibold text-slate-300 block">Captura de Cartão de Visita</label>
+                                
+                                {!isCameraActive ? (
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <button
+                                            type="button"
+                                            onClick={startCamera}
+                                            className={`${btnBaseCls} min-h-[44px] bg-indigo-600 hover:bg-indigo-500 text-white font-semibold flex items-center justify-center gap-2 shadow-lg active:scale-95`}
+                                        >
+                                            <i className="fa-solid fa-camera text-sm" aria-hidden="true"></i> 
+                                            <span>Abrir Câmara</span>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => fileInputRef.current?.click()}
+                                            className={`${btnBaseCls} min-h-[44px] bg-slate-800 hover:bg-slate-700 text-slate-100 font-semibold flex items-center justify-center gap-2 border border-slate-700 active:scale-95`}
+                                        >
+                                            <i className="fa-solid fa-upload text-sm" aria-hidden="true"></i> 
+                                            <span>Carregar Foto</span>
+                                        </button>
+                                    </div>
+                                ) : (
+                                    <div className="space-y-3 bg-slate-950 p-3 rounded-xl border border-slate-800">
+                                        <div className="relative rounded-lg overflow-hidden bg-black aspect-video flex items-center justify-center">
+                                            <video 
+                                                ref={videoRef} 
+                                                autoPlay 
+                                                playsInline 
+                                                muted
+                                                aria-label="Transmissão em direto da câmara"
+                                                style={{ transform: `rotate(${rotation}deg) scaleX(${isMirrored ? -1 : 1})` }}
+                                                className="w-full h-full object-cover"
+                                            ></video>
 
-                                        <div className="absolute top-2 right-2 flex gap-1.5">
+                                            {isProcessing && <div className="absolute inset-x-0 h-1 bg-indigo-400 scanline shadow-[0_0_8px_#818cf8]" aria-hidden="true"></div>}
+
+                                            <div className="absolute top-2 right-2 flex gap-2">
+                                                <button 
+                                                    type="button" 
+                                                    onClick={() => setIsMirrored(!isMirrored)} 
+                                                    aria-label={isMirrored ? "Desativar modo espelho" : "Ativar modo espelho"}
+                                                    className={`${btnBaseCls} bg-slate-900/90 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700`}
+                                                >
+                                                    Espelho
+                                                </button>
+                                                <button 
+                                                    type="button" 
+                                                    onClick={() => setRotation((r) => (r + 180) % 360)} 
+                                                    aria-label={`Rodar câmara (${rotation}º)`}
+                                                    className={`${btnBaseCls} bg-slate-900/90 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700`}
+                                                >
+                                                    {rotation}º
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <button
+                                            type="button"
+                                            disabled={isProcessing}
+                                            onClick={captureAndProcess}
+                                            className={`${btnBaseCls} w-full min-h-[44px] bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs flex items-center justify-center gap-2 shadow-lg active:scale-95 disabled:opacity-50`}
+                                        >
+                                            <i className="fa-solid fa-bolt" aria-hidden="true"></i> 
+                                            <span>{isProcessing ? 'A Analisar Cartão...' : 'Tirar Foto e Extrair Dados'}</span>
+                                        </button>
+
+                                        <div className="flex justify-between items-center text-xs pt-1">
+                                            <span className="text-indigo-300 font-medium">{statusMessage}</span>
                                             <button 
                                                 type="button" 
-                                                onClick={() => setIsMirrored(!isMirrored)} 
-                                                className="bg-slate-900/90 text-slate-300 px-2 py-1 rounded border border-slate-700 text-xs"
+                                                onClick={stopCamera} 
+                                                className={`${btnBaseCls} text-slate-300 hover:text-white underline p-1`}
                                             >
-                                                Espelho
-                                            </button>
-                                            <button 
-                                                type="button" 
-                                                onClick={() => setRotation((r) => (r + 180) % 360)} 
-                                                className="bg-slate-900/90 text-slate-300 px-2 py-1 rounded border border-slate-700 text-xs"
-                                            >
-                                                {rotation}º
+                                                Fechar Câmara
                                             </button>
                                         </div>
                                     </div>
+                                )}
+                            </div>
 
-                                    <button
-                                        type="button"
-                                        disabled={isProcessing}
-                                        onClick={captureAndProcess}
-                                        className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-xs transition flex items-center justify-center gap-2 shadow-lg active:scale-95 disabled:opacity-50"
-                                    >
-                                        <i className="fa-solid fa-bolt"></i> {isProcessing ? 'A analisar localmente...' : 'Tirar Foto e Analisar'}
-                                    </button>
-
-                                    <div className="flex justify-between items-center text-xs">
-                                        <span className="text-indigo-400">{statusMessage}</span>
-                                        <button type="button" onClick={stopCamera} className="text-slate-400 hover:text-white underline">Fechar</button>
-                                    </div>
-                                </div>
-                            )}
-
-                            <form onSubmit={handleSubmit} className="space-y-3 pt-2">
+                            <form onSubmit={handleSubmit} className="space-y-4 pt-2" noValidate>
                                 <div>
-                                    <label className="text-xs text-slate-400 mb-1 block">Nome do Contacto *</label>
+                                    <label htmlFor="input-nome" className="text-xs font-bold text-slate-200 mb-1.5 block">
+                                        Nome do Contacto <span className="text-indigo-400" aria-hidden="true">*</span>
+                                    </label>
                                     <input
+                                        id="input-nome"
+                                        ref={nameInputRef}
                                         type="text"
                                         value={formData.nome}
                                         onChange={e => setFormData({ ...formData, nome: e.target.value })}
                                         className={inputCls}
+                                        placeholder="Ex: Maria Santos"
                                         required
+                                        aria-required="true"
                                     />
                                 </div>
 
-                                <div className="grid grid-cols-2 gap-2">
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                     <div>
-                                        <label className="text-xs text-slate-400 mb-1 block">Empresa</label>
+                                        <label htmlFor="input-empresa" className="text-xs font-bold text-slate-200 mb-1.5 block">
+                                            Empresa
+                                        </label>
                                         <input
+                                            id="input-empresa"
                                             type="text"
                                             value={formData.empresa}
                                             onChange={e => setFormData({ ...formData, empresa: e.target.value })}
                                             className={inputCls}
+                                            placeholder="Ex: TecnoLógica Lda"
                                         />
                                     </div>
 
                                     <div>
-                                        <label className="text-xs text-slate-400 mb-1 block">Tipo de Contacto *</label>
+                                        <label htmlFor="select-tipo" className="text-xs font-bold text-slate-200 mb-1.5 block">
+                                            Tipo de Contacto <span className="text-indigo-400" aria-hidden="true">*</span>
+                                        </label>
                                         <select
+                                            id="select-tipo"
                                             value={formData.tipo_contacto}
                                             onChange={e => setFormData({ ...formData, tipo_contacto: e.target.value })}
                                             className={inputCls}
+                                            required
+                                            aria-required="true"
                                         >
                                             <option value="Potencial Cliente">Potencial Cliente</option>
                                             <option value="Cliente">Cliente</option>
@@ -799,78 +576,103 @@
                                     </div>
                                 </div>
 
-                                <div className="grid grid-cols-2 gap-2">
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                     <div>
-                                        <label className="text-xs text-slate-400 mb-1 block">Telefone</label>
+                                        <label htmlFor="input-telefone" className="text-xs font-bold text-slate-200 mb-1.5 block">
+                                            Telefone / Telemóvel
+                                        </label>
                                         <input
-                                            type="text"
+                                            id="input-telefone"
+                                            type="tel"
                                             value={formData.telefone}
                                             onChange={e => setFormData({ ...formData, telefone: e.target.value })}
                                             className={inputCls}
+                                            placeholder="Ex: 912 345 678"
                                         />
                                     </div>
                                     <div>
-                                        <label className="text-xs text-slate-400 mb-1 block">Email</label>
+                                        <label htmlFor="input-email" className="text-xs font-bold text-slate-200 mb-1.5 block">
+                                            Endereço de Email
+                                        </label>
                                         <input
+                                            id="input-email"
                                             type="email"
                                             value={formData.email}
                                             onChange={e => setFormData({ ...formData, email: e.target.value })}
                                             className={inputCls}
+                                            placeholder="Ex: maria@exemplo.pt"
                                         />
                                     </div>
                                 </div>
 
                                 <div>
-                                    <label className="text-xs text-slate-400 mb-1 block">Notas</label>
+                                    <label htmlFor="input-notas" className="text-xs font-bold text-slate-200 mb-1.5 block">
+                                        Notas Adicionais
+                                    </label>
                                     <textarea
+                                        id="input-notas"
                                         rows="2"
                                         value={formData.notas}
                                         onChange={e => setFormData({ ...formData, notas: e.target.value })}
                                         className={`${inputCls} resize-none`}
+                                        placeholder="Observações do contacto..."
                                     ></textarea>
                                 </div>
 
                                 <button
                                     type="submit"
-                                    className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-medium text-sm transition mt-2 flex items-center justify-center gap-2 shadow-lg active:scale-95"
+                                    className={`${btnBaseCls} w-full min-h-[44px] py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold text-sm transition mt-2 flex items-center justify-center gap-2 shadow-lg active:scale-95`}
                                 >
-                                    <i className="fa-solid fa-floppy-disk"></i> {editingId ? 'Atualizar Contacto' : 'Guardar Contacto'}
+                                    <i className="fa-solid fa-floppy-disk" aria-hidden="true"></i> 
+                                    <span>{editingId ? 'Atualizar Contacto' : 'Guardar Contacto'}</span>
                                 </button>
                             </form>
-                        </div>
+                        </section>
 
-                        <div className="bg-slate-900/60 border border-slate-800 p-5 rounded-2xl shadow-xl space-y-4">
-                            <div className="flex justify-between items-center">
-                                <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2">
-                                    <i className="fa-solid fa-users text-indigo-400"></i> Contactos ({filteredContacts.length})
+                        <section className="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-xl space-y-4" aria-labelledby="list-heading">
+                            <div className="flex justify-between items-center border-b border-slate-800 pb-3">
+                                <h2 id="list-heading" className="text-base font-bold text-slate-100 flex items-center gap-2">
+                                    <i className="fa-solid fa-users text-indigo-400" aria-hidden="true"></i> 
+                                    <span>Lista de Contactos ({filteredContacts.length})</span>
                                 </h2>
 
                                 <button
+                                    type="button"
                                     onClick={exportToCSV}
-                                    className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded-lg text-xs flex items-center gap-1.5 transition active:scale-95"
+                                    aria-label="Exportar lista de contactos para ficheiro CSV"
+                                    className={`${btnBaseCls} min-h-[36px] px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5`}
                                 >
-                                    <i className="fa-solid fa-file-csv text-emerald-400"></i> Exportar
+                                    <i className="fa-solid fa-file-csv text-emerald-400 text-sm" aria-hidden="true"></i> 
+                                    <span>Exportar</span>
                                 </button>
                             </div>
 
-                            <input
-                                type="text"
-                                placeholder="Pesquisar por nome, empresa ou email..."
-                                value={search}
-                                onChange={e => setSearch(e.target.value)}
-                                className={inputCls}
-                            />
+                            <div>
+                                <label htmlFor="input-search" className="sr-only">Pesquisar contactos</label>
+                                <div className="relative">
+                                    <input
+                                        id="input-search"
+                                        type="search"
+                                        placeholder="Pesquisar por nome, empresa ou email..."
+                                        value={search}
+                                        onChange={e => setSearch(e.target.value)}
+                                        className={`${inputCls} pl-10`}
+                                    />
+                                    <i className="fa-solid fa-magnifying-glass absolute left-3.5 top-3.5 text-slate-400 text-sm" aria-hidden="true"></i>
+                                </div>
+                            </div>
 
-                            <div className="flex gap-1.5 overflow-x-auto pb-1 text-xs">
+                            <div role="group" aria-label="Filtrar por categoria de contacto" className="flex gap-2 overflow-x-auto pb-1 text-xs">
                                 {['Todos', 'Potencial Cliente', 'Cliente', 'Fornecedor'].map(cat => (
                                     <button
                                         key={cat}
                                         type="button"
                                         onClick={() => setFilterCategory(cat)}
-                                        className={`px-3 py-1.5 rounded-lg border font-medium transition whitespace-nowrap ${
+                                        aria-pressed={filterCategory === cat}
+                                        className={`${btnBaseCls} px-3 py-2 border font-semibold whitespace-nowrap min-h-[38px] ${
                                             filterCategory === cat 
                                                 ? 'bg-indigo-600 border-indigo-500 text-white' 
-                                                : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                                                : 'bg-slate-950 border-slate-800 text-slate-300 hover:text-white'
                                         }`}
                                     >
                                         {cat}
@@ -878,52 +680,78 @@
                                 ))}
                             </div>
 
-                            <div className="space-y-3 max-h-[420px] overflow-y-auto pr-1">
+                            <div className="space-y-3 max-h-[440px] overflow-y-auto pr-1">
                                 {filteredContacts.length === 0 ? (
-                                    <div className="text-center py-12 text-slate-500 text-sm">
+                                    <div className="text-center py-12 text-slate-300 text-sm bg-slate-950/40 rounded-xl border border-slate-800/80">
                                         Nenhum contacto encontrado.
                                     </div>
                                 ) : (
                                     filteredContacts.map(c => (
-                                        <div key={c.id} className="bg-slate-950 border border-slate-800 p-4 rounded-xl space-y-2 relative group hover:border-slate-700 transition">
-                                            <div className="flex justify-between items-start pr-16">
+                                        <article 
+                                            key={c.id} 
+                                            className="bg-slate-950 border border-slate-800 p-4 rounded-xl space-y-2 relative group hover:border-slate-700 transition"
+                                            aria-labelledby={`contact-name-${c.id}`}
+                                        >
+                                            <div className="flex justify-between items-start pr-20">
                                                 <div>
-                                                    <div className="flex items-center gap-2">
-                                                        <h3 className="font-semibold text-slate-100">{c.nome}</h3>
+                                                    <div className="flex items-center gap-2 flex-wrap">
+                                                        <h3 id={`contact-name-${c.id}`} className="font-bold text-slate-100 text-sm">
+                                                            {c.nome}
+                                                        </h3>
                                                         {getTypeBadge(c.tipo_contacto || 'Potencial Cliente')}
                                                     </div>
-                                                    {c.empresa && <p className="text-xs text-indigo-400 font-medium mt-0.5">{c.empresa}</p>}
+                                                    {c.empresa && (
+                                                        <p className="text-xs text-indigo-300 font-semibold mt-0.5">
+                                                            {c.empresa}
+                                                        </p>
+                                                    )}
                                                 </div>
 
-                                                <div className="absolute top-3 right-3 flex items-center gap-1.5">
+                                                <div className="absolute top-3 right-3 flex items-center gap-1">
                                                     <button
+                                                        type="button"
                                                         onClick={() => handleEdit(c)}
-                                                        className="text-slate-500 hover:text-indigo-400 text-xs p-1"
-                                                        title="Editar"
+                                                        aria-label={`Editar contacto de ${c.nome}`}
+                                                        className={`${btnBaseCls} min-w-[44px] min-h-[44px] text-slate-300 hover:text-indigo-300 flex items-center justify-center`}
                                                     >
-                                                        <i className="fa-solid fa-pen"></i>
+                                                        <i className="fa-solid fa-pen text-sm" aria-hidden="true"></i>
                                                     </button>
                                                     <button
-                                                        onClick={() => handleDelete(c.id)}
-                                                        className="text-slate-500 hover:text-red-400 text-xs p-1"
-                                                        title="Eliminar"
+                                                        type="button"
+                                                        onClick={() => handleDelete(c.id, c.nome)}
+                                                        aria-label={`Eliminar contacto de ${c.nome}`}
+                                                        className={`${btnBaseCls} min-w-[44px] min-h-[44px] text-slate-300 hover:text-red-400 flex items-center justify-center`}
                                                     >
-                                                        <i className="fa-solid fa-trash"></i>
+                                                        <i className="fa-solid fa-trash text-sm" aria-hidden="true"></i>
                                                     </button>
                                                 </div>
                                             </div>
 
-                                            <div className="text-xs text-slate-400 space-y-1 pt-1 border-t border-slate-800/80">
-                                                {c.telefone && <p><i className="fa-solid fa-phone text-slate-500 w-4"></i> {c.telefone}</p>}
-                                                {c.email && <p><i className="fa-solid fa-envelope text-slate-500 w-4"></i> {c.email}</p>}
-                                                {c.notas && <p className="text-[11px] text-slate-500 italic pt-0.5">"{c.notas}"</p>}
+                                            <div className="text-xs text-slate-300 space-y-1 pt-2 border-t border-slate-800">
+                                                {c.telefone && (
+                                                    <p className="flex items-center gap-2">
+                                                        <i className="fa-solid fa-phone text-slate-400 w-4 text-center" aria-hidden="true"></i> 
+                                                        <span>{c.telefone}</span>
+                                                    </p>
+                                                )}
+                                                {c.email && (
+                                                    <p className="flex items-center gap-2">
+                                                        <i className="fa-solid fa-envelope text-slate-400 w-4 text-center" aria-hidden="true"></i> 
+                                                        <span>{c.email}</span>
+                                                    </p>
+                                                )}
+                                                {c.notas && (
+                                                    <p className="text-[11px] text-slate-300 italic pt-1">
+                                                        "{c.notas}"
+                                                    </p>
+                                                )}
                                             </div>
-                                        </div>
+                                        </article>
                                     ))
                                 )}
                             </div>
-                        </div>
-                    </div>
+                        </section>
+                    </main>
                 </div>
             );
         }
@@ -933,4 +761,3 @@
     </script>
 </body>
 </html>
-
